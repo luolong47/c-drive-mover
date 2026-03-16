@@ -1,0 +1,27 @@
+@import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
+
+@layer utilities {
+  .custom-scrollbar::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  .custom-scrollbar::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .custom-scrollbar::-webkit-scrollbar-thumb {
+    background-color: #d4d4d8; /* zinc-300 */
+    border-radius: 20px;
+  }
+  .custom-scrollbar:hover::-webkit-scrollbar-thumb {
+    background-color: #a1a1aa; /* zinc-400 */
+  }
+
+  /* Dark mode scrollbar for terminal */
+  .bg-\[\#151619\] .custom-scrollbar::-webkit-scrollbar-thumb {
+    background-color: #3f3f46; /* zinc-700 */
+  }
+  .bg-\[\#151619\] .custom-scrollbar:hover::-webkit-scrollbar-thumb {
+    background-color: #52525b; /* zinc-600 */
+  }
+}
