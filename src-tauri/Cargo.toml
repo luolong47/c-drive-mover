@@ -1,5 +1,5 @@
 [package]
-name = "app"
+name = "c-drive-mover"
 version = "0.1.0"
 description = "A Tauri App"
 authors = ["you"]
@@ -29,3 +29,4 @@ junction = "1.2"
 walkdir = "2.5"
 dirs = "6.0"
 everything-sdk = "0.0.6"
+rfd = "0.15"

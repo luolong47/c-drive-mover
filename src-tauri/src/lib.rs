@@ -340,6 +340,14 @@ fn search_everything(query: String) -> Result<Vec<FileEntry>, String> {
     Ok(result)
 }
 
+#[tauri::command]
+fn select_directory() -> Option<String> {
+    rfd::FileDialog::new()
+        .set_title("选择目标基础路径")
+        .pick_folder()
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
   tauri::Builder::default()
@@ -353,7 +361,8 @@ pub fn run() {
         run_migration,
         restore_task,
         get_home_dir,
-        search_everything
+        search_everything,
+        select_directory
     ])
     .setup(|_app| {
         Ok(())

@@ -5,7 +5,8 @@
   "scripts": {
     "lint": "biome check --write .",
     "prebuild": "pnpm lint",
-    "build": "tauri build"
+    "build": "tauri build && node -e \"const fs=require('fs'); if(!fs.existsSync('dist/release'))fs.mkdirSync('dist/release', {recursive:true}); fs.copyFileSync('src-tauri/target/release/c-drive-mover.exe', 'dist/release/c-drive-mover.exe')\"",
+    "postbuild": "echo [Done] Final product is in dist/release/"
   },
   "dependencies": {
     "@google/genai": "^1.17.0",

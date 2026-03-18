@@ -65,3 +65,7 @@ export async function getHomeDir(): Promise<string> {
 export async function searchEverything(query: string): Promise<FileEntry[]> {
   return await invoke('search_everything', { query });
 }
+
+export async function selectDirectory(): Promise<string | null> {
+  return await invoke('select_directory');
+}
