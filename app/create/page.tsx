@@ -12,15 +12,17 @@ import {
   X,
 } from 'lucide-react';
 import { useRouter } from 'next/navigation';
-import { type KeyboardEvent, useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import {
   type DiskInfo,
   type FileEntry,
   getDiskInfo,
   getFolderSize,
+  getHomeDir,
   type MoveTask,
   saveTask,
   scanDirectory,
+  searchEverything,
 } from '@/lib/tauri-api';
 import { formatBytes, getCommonPrefix } from '@/lib/utils';
 
@@ -30,16 +32,97 @@ interface FileNode extends FileEntry {
   loading?: boolean;
 }
 
-interface TreeNodeProps {
-  node: FileNode;
-  depth: number;
-  expandedNodes: Set<string>;
-  selectedPaths: Map<string, number>;
-  searchQuery: string;
-  toggleNode: (node: FileNode) => void;
-  toggleSelection: (path: string) => void;
-  renderTree: (nodes: FileNode[], depth: number) => React.ReactNode;
+// --- 工具函数 ---
+
+function getOrCreateNode(
+  allNodes: Map<string, FileNode>,
+  path: string,
+  name: string,
+  roots: FileNode[],
+  parent: FileNode | null,
+): FileNode {
+  let node = allNodes.get(path);
+  if (!node) {
+    node = {
+      id: path,
+      name: name || path,
+      path,
+      is_dir: true,
+      size: 0,
+      children: [],
+    };
+    allNodes.set(path, node);
+    if (parent) parent.children?.push(node);
+    else roots.push(node);
+  }
+  return node;
 }
+
+function processPath(
+  path: string,
+  query: string,
+  allNodes: Map<string, FileNode>,
+  roots: FileNode[],
+  parentPaths: Set<string>,
+) {
+  const parts = path.split('\\');
+  let currentPath = '';
+  let parent: FileNode | null = null;
+  let foundFirstMatch = false;
+
+  for (let i = 0; i < parts.length; i++) {
+    const part = parts[i];
+    if (!part && i > 0) continue;
+
+    if (i === 0 && part.endsWith(':')) {
+      currentPath = `${part}\\`;
+    } else {
+      currentPath += (currentPath.endsWith('\\') ? '' : '\\') + part;
+    }
+
+    const node = getOrCreateNode(allNodes, currentPath, part, roots, parent);
+    if (!foundFirstMatch && parent) parentPaths.add(parent.id);
+    if (part.toLowerCase().includes(query.toLowerCase())) foundFirstMatch = true;
+    parent = node;
+  }
+}
+
+function buildTreeFromPaths(
+  entries: FileEntry[],
+  query: string,
+): { roots: FileNode[]; parentPaths: Set<string> } {
+  const allNodes = new Map<string, FileNode>();
+  const roots: FileNode[] = [];
+  const parentPaths = new Set<string>();
+
+  for (const entry of entries) {
+    processPath(entry.path, query, allNodes, roots, parentPaths);
+  }
+  return { roots, parentPaths };
+}
+
+// 合并单子节点目录以实现紧凑展示
+function compactNodes(nodes: FileNode[]): FileNode[] {
+  return nodes.map((node) => {
+    const current = { ...node };
+    if (current.children && current.children.length > 0) {
+      current.children = compactNodes(current.children);
+    }
+
+    // 如果只有一个子节点，则合并
+    if (current.children && current.children.length === 1) {
+      const child = current.children[0];
+      const sep = current.name.endsWith('\\') ? '' : '\\';
+      return {
+        ...child,
+        name: `${current.name}${sep}${child.name}`,
+      };
+    }
+    return current;
+  });
+}
+
+// --- 子组件 ---
 
 function TreeNode({
   node,
@@ -49,33 +132,27 @@ function TreeNode({
   searchQuery,
   toggleNode,
   toggleSelection,
+  loadDirectory,
   renderTree,
-}: TreeNodeProps) {
-  const isExpanded = expandedNodes.has(node.id);
+}: {
+  node: FileNode;
+  depth: number;
+  expandedNodes: Set<string>;
+  selectedPaths: Map<string, number>;
+  searchQuery: string;
+  toggleNode: (node: FileNode) => void;
+  toggleSelection: (path: string) => void;
+  loadDirectory: (node: FileNode) => void;
+  renderTree: (nodes: FileNode[], depth: number) => React.ReactNode;
+}) {
   const isSelected = selectedPaths.has(node.path);
+  const isExpanded = expandedNodes.has(node.id);
 
-  if (
-    searchQuery &&
-    !node.path.toLowerCase().includes(searchQuery.toLowerCase()) &&
-    !node.children?.some((c: FileNode) => c.path.toLowerCase().includes(searchQuery.toLowerCase()))
-  ) {
-    return null;
-  }
-
-  const handleKeyDown = (e: KeyboardEvent) => {
-    if (e.key === 'Enter' || e.key === ' ') {
-      e.preventDefault();
-      if (!node.loading) toggleNode(node);
+  useEffect(() => {
+    if (!searchQuery && isExpanded && !node.children?.length && !node.loading) {
+      loadDirectory(node);
     }
-  };
-
-  const handleSelectKeyDown = (e: KeyboardEvent) => {
-    if (e.key === 'Enter' || e.key === ' ') {
-      e.preventDefault();
-      e.stopPropagation();
-      toggleSelection(node.path);
-    }
-  };
+  }, [searchQuery, isExpanded, node, loadDirectory]);
 
   return (
     <div className="select-none">
@@ -84,7 +161,6 @@ function TreeNode({
         className={`w-full flex items-center gap-2 py-1.5 px-2 hover:bg-zinc-100 dark:hover:bg-zinc-800 rounded-md cursor-pointer transition-colors ${isSelected ? 'bg-indigo-50/50 dark:bg-indigo-500/10' : ''}`}
         style={{ paddingLeft: `${depth * 16 + 8}px` }}
         onClick={() => (node.loading ? null : toggleNode(node))}
-        onKeyDown={handleKeyDown}
       >
         <div className="w-4 h-4 flex items-center justify-center text-zinc-400 dark:text-zinc-500 shrink-0">
           {node.loading ? (
@@ -96,7 +172,6 @@ function TreeNode({
             />
           )}
         </div>
-
         <button
           type="button"
           className="text-indigo-500 dark:text-indigo-400 hover:text-indigo-600 dark:hover:text-indigo-300 transition-colors"
@@ -104,7 +179,6 @@ function TreeNode({
             e.stopPropagation();
             toggleSelection(node.path);
           }}
-          onKeyDown={handleSelectKeyDown}
         >
           {isSelected ? (
             <CheckSquare size={16} className="text-indigo-600 dark:text-indigo-400" />
@@ -112,16 +186,176 @@ function TreeNode({
             <Square size={16} />
           )}
         </button>
-
         <span className="text-sm font-medium text-zinc-700 dark:text-zinc-300 truncate">
           {node.name}
         </span>
       </button>
-
       {node.children && isExpanded && <div>{renderTree(node.children, depth + 1)}</div>}
     </div>
   );
 }
+
+// --- Hooks ---
+
+function useEverythingSearch(searchQuery: string, setExpandedNodes: (s: Set<string>) => void) {
+  const [searchTree, setSearchTree] = useState<FileNode[]>([]);
+  const [isSearching, setIsSearching] = useState(false);
+
+  useEffect(() => {
+    const search = async () => {
+      if (!searchQuery.trim()) {
+        setSearchTree([]);
+        return;
+      }
+      setIsSearching(true);
+      try {
+        const results = await searchEverything(searchQuery);
+        const { roots, parentPaths } = buildTreeFromPaths(results, searchQuery);
+        setSearchTree(roots);
+        setExpandedNodes(parentPaths);
+      } catch (err) {
+        console.error('Search error:', err);
+      } finally {
+        setIsSearching(false);
+      }
+    };
+    const timer = setTimeout(search, 300);
+    return () => clearTimeout(timer);
+  }, [searchQuery, setExpandedNodes]);
+
+  return { searchTree, isSearching };
+}
+
+function useInitialize(
+  setTargetDisk: (d: DiskInfo | null) => void,
+  setRootNodes: (n: FileNode[]) => void,
+) {
+  useEffect(() => {
+    const init = async () => {
+      try {
+        const [disks, homeDir] = await Promise.all([getDiskInfo(), getHomeDir()]);
+        const dDrive = disks.find((d) => d.mount_point.startsWith('D'));
+        if (dDrive) setTargetDisk(dDrive);
+        const nodes = [homeDir].filter(Boolean).map((p) => ({
+          id: p,
+          name: p.split('\\').pop() || p,
+          path: p,
+          is_dir: true,
+          size: 0,
+          children: [],
+        }));
+        setRootNodes(nodes);
+      } catch (err) {
+        console.error('Init error:', err);
+      }
+    };
+    init();
+  }, [setTargetDisk, setRootNodes]);
+}
+
+function useTaskStatistics(selectedPaths: Map<string, number>, targetDisk: DiskInfo | null) {
+  const totalSize = useMemo(
+    () => Array.from(selectedPaths.values()).reduce((acc, s) => acc + s, 0),
+    [selectedPaths],
+  );
+  const commonPrefix = useMemo(
+    () => getCommonPrefix(Array.from(selectedPaths.keys())),
+    [selectedPaths],
+  );
+  const selectedItems = useMemo(
+    () => Array.from(selectedPaths.entries()).map(([path, size]) => ({ path, size })),
+    [selectedPaths],
+  );
+  const freeSpace = targetDisk?.available_space || 1024 * 1024 * 1024 * 100;
+  return { totalSize, commonPrefix, selectedItems, freeSpace };
+}
+
+function useTaskActions(
+  setRootNodes: (updater: (prev: FileNode[]) => FileNode[]) => void,
+  selectedPaths: Map<string, number>,
+  setSelectedPaths: (m: Map<string, number>) => void,
+  expandedNodes: Set<string>,
+  setExpandedNodes: (s: Set<string>) => void,
+  taskName: string,
+  targetBase: string,
+  setIsSaving: (b: boolean) => void,
+  router: ReturnType<typeof useRouter>,
+) {
+  const loadDirectory = async (node: FileNode) => {
+    if (node.children?.length || node.loading) return;
+    setRootNodes((prev) =>
+      prev.map((n) => {
+        const update = (curr: FileNode): FileNode => {
+          if (curr.id === node.id) return { ...curr, loading: true };
+          if (curr.children) return { ...curr, children: curr.children.map(update) };
+          return curr;
+        };
+        return update(n);
+      }),
+    );
+    try {
+      const entries = await scanDirectory(node.path);
+      const children = entries.map((e) => ({ ...e, id: e.path, children: [] }));
+      setRootNodes((prev) =>
+        prev.map((n) => {
+          const update = (curr: FileNode): FileNode => {
+            if (curr.id === node.id) return { ...curr, children, loading: false };
+            if (curr.children) return { ...curr, children: curr.children.map(update) };
+            return curr;
+          };
+          return update(n);
+        }),
+      );
+    } catch (err) {
+      console.error('Scan error:', err);
+    }
+  };
+  const toggleNode = (node: FileNode) => {
+    const next = new Set(expandedNodes);
+    if (next.has(node.id)) next.delete(node.id);
+    else {
+      next.add(node.id);
+      loadDirectory(node);
+    }
+    setExpandedNodes(next);
+  };
+  const toggleSelection = async (path: string) => {
+    const next = new Map(selectedPaths);
+    if (next.has(path)) next.delete(path);
+    else {
+      try {
+        const size = await getFolderSize(path);
+        next.set(path, size);
+      } catch (err) {
+        console.error('Size error:', err);
+      }
+    }
+    setSelectedPaths(next);
+  };
+  const handleSave = async () => {
+    if (!taskName || selectedPaths.size === 0 || !targetBase) return;
+    setIsSaving(true);
+    try {
+      const task: MoveTask = {
+        id: crypto.randomUUID(),
+        name: taskName,
+        target_base: targetBase,
+        sources: Array.from(selectedPaths.entries()).map(([p, s]) => ({ path: p, size: s })),
+        status: 'pending',
+        created_at: Math.floor(Date.now() / 1000),
+      };
+      await saveTask(task);
+      router.push('/tasks');
+    } catch (err) {
+      console.error('Save error:', err);
+    } finally {
+      setIsSaving(false);
+    }
+  };
+  return { loadDirectory, toggleNode, toggleSelection, handleSave };
+}
+
+// --- 主页面 ---
 
 export default function CreateTaskPage() {
   const router = useRouter();
@@ -131,119 +365,45 @@ export default function CreateTaskPage() {
   const [selectedPaths, setSelectedPaths] = useState<Map<string, number>>(new Map());
   const [rootNodes, setRootNodes] = useState<FileNode[]>([]);
   const [expandedNodes, setExpandedNodes] = useState<Set<string>>(new Set());
-  const [targetDisk, setTargetDisk] = useState<DiskInfo | null>(null);
   const [isSaving, setIsSaving] = useState(false);
+  const [targetDisk, setTargetDisk] = useState<DiskInfo | null>(null);
 
-  useEffect(() => {
-    const init = async () => {
-      try {
-        const disks = await getDiskInfo();
-        const dDrive = disks.find((d) => d.mount_point.startsWith('D'));
-        if (dDrive) setTargetDisk(dDrive);
+  const { searchTree, isSearching } = useEverythingSearch(searchQuery, setExpandedNodes);
+  const { totalSize, commonPrefix, selectedItems, freeSpace } = useTaskStatistics(
+    selectedPaths,
+    targetDisk,
+  );
+  const { loadDirectory, toggleNode, toggleSelection, handleSave } = useTaskActions(
+    setRootNodes,
+    selectedPaths,
+    setSelectedPaths,
+    expandedNodes,
+    setExpandedNodes,
+    taskName,
+    targetBase,
+    setIsSaving,
+    router,
+  );
 
-        const initialPaths = [
-          'C:\\Users',
-          'C:\\ProgramData',
-          'C:\\Program Files',
-          'C:\\Program Files (x86)',
-        ];
+  useInitialize(setTargetDisk, setRootNodes);
 
-        const nodes = initialPaths.map((p) => ({
-          id: p,
-          name: p.split('\\').pop() || p,
-          path: p,
-          is_dir: true,
-          size: 0,
-        }));
-        setRootNodes(nodes);
-      } catch (err) {
-        console.error('Init failed:', err);
-      }
-    };
-    init();
-  }, []);
+  const isAnyLoading = useMemo(
+    () =>
+      isSearching ||
+      (function check(nodes: FileNode[]): boolean {
+        return nodes.some((n) => n.loading || (n.children && check(n.children)));
+      })(rootNodes),
+    [rootNodes, isSearching],
+  );
 
-  const totalSize = useMemo(() => {
-    return Array.from(selectedPaths.values()).reduce((acc, s) => acc + s, 0);
-  }, [selectedPaths]);
+  // 紧凑化展示节点
+  const displayRoots = useMemo(() => {
+    const raw = searchQuery ? searchTree : rootNodes;
+    return compactNodes(raw);
+  }, [searchQuery, searchTree, rootNodes]);
 
-  const commonPrefix = useMemo(() => {
-    return getCommonPrefix(Array.from(selectedPaths.keys()));
-  }, [selectedPaths]);
-
-  const selectedItems = useMemo(() => {
-    return Array.from(selectedPaths.entries()).map(([path, size]) => ({ path, size }));
-  }, [selectedPaths]);
-
-  const loadDirectory = async (node: FileNode) => {
-    if (node.children || node.loading) return;
-
-    const updateLoading = (nodes: FileNode[]): FileNode[] => {
-      return nodes.map((n) => {
-        if (n.id === node.id) return { ...n, loading: true };
-        if (n.children) return { ...n, children: updateLoading(n.children) };
-        return n;
-      });
-    };
-    setRootNodes((prev) => updateLoading(prev));
-
-    try {
-      const entries = await scanDirectory(node.path);
-      const children = entries.map((e) => ({
-        ...e,
-        id: e.path,
-      }));
-
-      const updateChildren = (nodes: FileNode[]): FileNode[] => {
-        return nodes.map((n) => {
-          if (n.id === node.id) return { ...n, children, loading: false };
-          if (n.children) return { ...n, children: updateChildren(n.children) };
-          return n;
-        });
-      };
-      setRootNodes((prev) => updateChildren(prev));
-    } catch (err) {
-      console.error('Scan failed:', err);
-      const resetLoading = (nodes: FileNode[]): FileNode[] => {
-        return nodes.map((n) => {
-          if (n.id === node.id) return { ...n, loading: false };
-          if (n.children) return { ...n, children: resetLoading(n.children) };
-          return n;
-        });
-      };
-      setRootNodes((prev) => resetLoading(prev));
-    }
-  };
-
-  const toggleNode = (node: FileNode) => {
-    const newExpanded = new Set(expandedNodes);
-    if (newExpanded.has(node.id)) {
-      newExpanded.delete(node.id);
-    } else {
-      newExpanded.add(node.id);
-      loadDirectory(node);
-    }
-    setExpandedNodes(newExpanded);
-  };
-
-  const toggleSelection = async (path: string) => {
-    const newSelected = new Map(selectedPaths);
-    if (newSelected.has(path)) {
-      newSelected.delete(path);
-      setSelectedPaths(newSelected);
-    } else {
-      try {
-        const size = await getFolderSize(path);
-        newSelected.set(path, size);
-        setSelectedPaths(newSelected);
-      } catch (err) {
-        console.error('Size calculation failed:', err);
-      }
-    }
-  };
-
-  const renderTree = (nodes: FileNode[], depth = 0) => {
-    return nodes.map((node) => (
+  const renderTree = (nodes: FileNode[], depth = 0): React.ReactNode =>
+    nodes.map((node) => (
       <TreeNode
         key={node.id}
         node={node}
@@ -253,35 +413,10 @@ export default function CreateTaskPage() {
         searchQuery={searchQuery}
         toggleNode={toggleNode}
         toggleSelection={toggleSelection}
+        loadDirectory={loadDirectory}
         renderTree={renderTree}
       />
     ));
-  };
-
-  const handleSave = async () => {
-    if (!taskName || selectedPaths.size === 0 || !targetBase) return;
-    setIsSaving(true);
-    try {
-      const newTask: MoveTask = {
-        id: crypto.randomUUID(),
-        name: taskName,
-        target_base: targetBase,
-        sources: Array.from(selectedPaths.entries()).map(([path, size]) => ({ path, size })),
-        status: 'pending',
-        created_at: Math.floor(Date.now() / 1000),
-      };
-      await saveTask(newTask);
-      router.push('/tasks');
-    } catch (err) {
-      console.error('Save failed:', err);
-    } finally {
-      setIsSaving(false);
-    }
-  };
-
-  // Capacity check
-  const FREE_SPACE = targetDisk?.available_space || 1024 * 1024 * 1024 * 100;
-  const isOverCapacity = totalSize > FREE_SPACE;
 
   return (
     <div className="p-8 max-w-6xl mx-auto h-full flex flex-col">
@@ -304,7 +439,11 @@ export default function CreateTaskPage() {
             type="button"
             onClick={handleSave}
             disabled={
-              !taskName || selectedPaths.size === 0 || !targetBase || isOverCapacity || isSaving
+              !taskName ||
+              selectedPaths.size === 0 ||
+              !targetBase ||
+              totalSize > freeSpace ||
+              isSaving
             }
             className="px-4 py-2 text-sm font-medium text-white bg-indigo-600 dark:bg-indigo-500 hover:bg-indigo-700 dark:hover:bg-indigo-600 disabled:opacity-50 disabled:cursor-not-allowed rounded-lg transition-colors flex items-center gap-2 shadow-sm"
           >
@@ -341,25 +480,28 @@ export default function CreateTaskPage() {
                 >
                   目标基础路径 (Target Base)
                 </label>
-                <div className="flex gap-2">
-                  <input
-                    id="target-base"
-                    type="text"
-                    value={targetBase}
-                    onChange={(e) => setTargetBase(e.target.value)}
-                    placeholder="D:\Cdrive-Mover"
-                    className="w-full px-3 py-2 bg-white dark:bg-zinc-900 border-none rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20 text-zinc-900 dark:text-zinc-100 transition-all font-mono"
-                  />
-                </div>
+                <input
+                  id="target-base"
+                  type="text"
+                  value={targetBase}
+                  onChange={(e) => setTargetBase(e.target.value)}
+                  placeholder="D:\Cdrive-Mover"
+                  className="w-full px-3 py-2 bg-white dark:bg-zinc-900 border-none rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20 text-zinc-900 dark:text-zinc-100 transition-all font-mono"
+                />
               </div>
             </div>
           </div>
 
           <div className="bg-zinc-100/80 dark:bg-zinc-900/50 border border-zinc-200/50 dark:border-zinc-800/50 rounded-2xl p-4 flex flex-col flex-1 min-h-0 transition-colors">
             <div className="flex justify-between items-center mb-3 shrink-0">
-              <h2 className="text-sm font-medium text-zinc-900 dark:text-zinc-100">
-                选择源目录 (Sources)
-              </h2>
+              <div className="flex items-center gap-2">
+                <h2 className="text-sm font-medium text-zinc-900 dark:text-zinc-100">
+                  选择源目录 (Sources)
+                </h2>
+                {isAnyLoading && (
+                  <Loader2 size={14} className="animate-spin text-indigo-500 opacity-80" />
+                )}
+              </div>
               <div className="relative w-48">
                 <Search
                   className="absolute left-2.5 top-1/2 -translate-y-1/2 text-zinc-400 dark:text-zinc-500"
@@ -375,48 +517,61 @@ export default function CreateTaskPage() {
               </div>
             </div>
             <div className="bg-white dark:bg-zinc-900 rounded-xl p-2 overflow-y-auto flex-1 custom-scrollbar transition-colors">
-              {renderTree(rootNodes)}
+              {searchQuery ? (
+                displayRoots.length === 0 && !isSearching ? (
+                  <div className="h-full flex flex-col items-center justify-center text-zinc-400 dark:text-zinc-600 py-12">
+                    <Search size={32} className="mb-2 opacity-50" />
+                    <p className="text-xs">未找到匹配目录 (需运行 Everything 服务)</p>
+                  </div>
+                ) : (
+                  renderTree(displayRoots)
+                )
+              ) : displayRoots.length === 0 ? (
+                <div className="h-full flex flex-col items-center justify-center text-zinc-400 dark:text-zinc-600">
+                  <Loader2 size={24} className="animate-spin mb-2 opacity-50" />
+                  <p className="text-xs">正在初始化目录...</p>
+                </div>
+              ) : (
+                renderTree(displayRoots)
+              )}
             </div>
           </div>
         </div>
 
         <div className="lg:col-span-5 flex flex-col gap-6 min-h-0">
           <div
-            className={`bg-zinc-100/80 dark:bg-zinc-900/50 border border-zinc-200/50 dark:border-zinc-800/50 rounded-2xl p-4 shrink-0 transition-colors ${isOverCapacity ? 'bg-red-100/60 dark:bg-red-500/10 border-red-200 dark:border-red-500/20' : ''}`}
+            className={`bg-zinc-100/80 dark:bg-zinc-900/50 border border-zinc-200/50 dark:border-zinc-800/50 rounded-2xl p-4 shrink-0 transition-colors ${totalSize > freeSpace ? 'bg-red-100/60 dark:bg-red-500/10 border-red-200 dark:border-red-500/20' : ''}`}
           >
             <h2 className="text-sm font-medium text-zinc-900 dark:text-zinc-100 mb-4">容量预估</h2>
             <div className="flex justify-between items-end mb-2">
               <span className="text-xs text-zinc-500 dark:text-zinc-400">预计迁移总大小</span>
               <span
-                className={`text-3xl font-light font-mono ${isOverCapacity ? 'text-red-600 dark:text-red-400' : 'text-zinc-900 dark:text-zinc-100'}`}
+                className={`text-3xl font-light font-mono ${totalSize > freeSpace ? 'text-red-600 dark:text-red-400' : 'text-zinc-900 dark:text-zinc-100'}`}
               >
                 {totalSize === 0 ? '0 Bytes' : formatBytes(totalSize)}
               </span>
             </div>
-
             <div className="h-2 bg-white dark:bg-zinc-900 rounded-full overflow-hidden mb-2 transition-colors">
               <div
-                className={`h-full transition-all duration-500 ${isOverCapacity ? 'bg-red-500 dark:bg-red-400' : 'bg-indigo-500 dark:bg-indigo-400'}`}
-                style={{ width: `${Math.min((totalSize / FREE_SPACE) * 100, 100)}%` }}
+                className={`h-full transition-all duration-500 ${totalSize > freeSpace ? 'bg-red-500 dark:bg-red-400' : 'bg-indigo-500 dark:bg-indigo-400'}`}
+                style={{ width: `${Math.min((totalSize / freeSpace) * 100, 100)}%` }}
               />
             </div>
-
             <div className="flex justify-between text-xs font-mono">
               <span className="text-zinc-500 dark:text-zinc-400">
-                目标盘剩余: {formatBytes(FREE_SPACE)}
+                目标盘剩余: {formatBytes(freeSpace)}
               </span>
               <span
                 className={
-                  isOverCapacity
+                  totalSize > freeSpace
                     ? 'text-red-500 dark:text-red-400 font-medium'
                     : 'text-zinc-400 dark:text-zinc-500'
                 }
               >
-                {((totalSize / FREE_SPACE) * 100).toFixed(1)}%
+                {((totalSize / freeSpace) * 100).toFixed(1)}%
               </span>
             </div>
-
-            {isOverCapacity && (
+            {totalSize > freeSpace && (
               <div className="mt-4 flex items-start gap-2 text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-500/10 p-3 rounded-md border border-red-100 dark:border-red-500/20">
                 <AlertTriangle size={16} className="shrink-0 mt-0.5" />
                 <p className="text-xs font-medium leading-relaxed">
@@ -433,7 +588,6 @@ export default function CreateTaskPage() {
                 系统将自动提取公共前缀并保留目录层级结构
               </p>
             </div>
-
             <div className="bg-white dark:bg-zinc-900 rounded-xl p-4 overflow-y-auto flex-1 custom-scrollbar transition-colors">
               {selectedItems.length === 0 ? (
                 <div className="h-full flex flex-col items-center justify-center text-zinc-400 dark:text-zinc-600">
@@ -450,15 +604,13 @@ export default function CreateTaskPage() {
                       {commonPrefix || '无'}
                     </p>
                   </div>
-
                   <div className="space-y-3">
                     <p className="text-[10px] font-bold text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">
                       生成的目标路径
                     </p>
                     {selectedItems.map((item) => {
-                      const relativePath = item.path.substring(commonPrefix.length);
-                      const finalPath = `${targetBase}\\${taskName || '[方案名]'}\\${relativePath}`;
-
+                      const rel = item.path.substring(commonPrefix.length);
+                      const final = `${targetBase}\\${taskName || '[方案名]'}\\${rel}`;
                       return (
                         <div
                           key={item.path}
@@ -472,7 +624,7 @@ export default function CreateTaskPage() {
                             源: {item.path}
                           </p>
                           <p className="text-xs font-mono text-indigo-700 dark:text-indigo-400 break-all">
-                            {finalPath}
+                            {final}
                           </p>
                         </div>
                       );

@@ -72,22 +72,32 @@ fn get_disk_info() -> Vec<DiskInfo> {
 
 #[tauri::command]
 fn scan_directory(path: String) -> Result<Vec<FileEntry>, String> {
+    let home_dir = dirs::home_dir().unwrap_or_default();
+    let temp_exclude = home_dir.join("AppData").join("Local").join("Temp");
+    let temp_exclude_str = temp_exclude.to_string_lossy().to_lowercase();
+
     let entries = fs::read_dir(path).map_err(|e| e.to_string())?;
     let mut result = Vec::new();
 
     for entry in entries {
         if let Ok(entry) = entry {
-            let path = entry.path();
+            let entry_path = entry.path();
+            let entry_path_str = entry_path.to_string_lossy().to_lowercase();
+
+            // 排除 Temp 目录
+            if entry_path_str == temp_exclude_str {
+                continue;
+            }
+
             let metadata = entry.metadata().ok();
             let is_dir = metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false);
             
-            // Only return directories for source selection to simplify
             if is_dir {
                 result.push(FileEntry {
                     name: entry.file_name().to_string_lossy().into_owned(),
-                    path: path.to_string_lossy().into_owned(),
+                    path: entry_path.to_string_lossy().into_owned(),
                     is_dir,
-                    size: 0, // Calculations happen separately for performance
+                    size: 0,
                 });
             }
         }
@@ -278,6 +288,58 @@ async fn restore_task(task_id: String) -> Result<(), String> {
     }
 }
 
+#[tauri::command]
+fn get_home_dir() -> String {
+    dirs::home_dir()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "C:\\Users".to_string())
+}
+
+#[tauri::command]
+fn search_everything(query: String) -> Result<Vec<FileEntry>, String> {
+    use everything_sdk::{global, RequestFlags};
+
+    // 获取用户主目录作为搜索基准
+    let home_dir = dirs::home_dir()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "C:\\Users".to_string());
+
+    // 获取 Everything 全局锁
+    let mut everything = global().try_lock().map_err(|_| "无法获取 Everything 锁，请检查是否已启动 Everything 且没有其他查询正在运行")?;
+    
+    // 检查数据库是否加载
+    if !everything.is_db_loaded().map_err(|e| e.to_string())? {
+        return Err("Everything 数据库尚未加载完成".to_string());
+    }
+
+    let mut searcher = everything.searcher();
+    
+    let temp_exclude = format!("{}\\AppData\\Local\\Temp", home_dir);
+
+    // 限制在主目录下搜索文件夹，并排除 Temp 目录
+    searcher.set_search(&format!("\"{}\" !\"{}\" folder: {}", home_dir, temp_exclude, query))
+            .set_max(100)
+            .set_request_flags(RequestFlags::EVERYTHING_REQUEST_FILE_NAME | RequestFlags::EVERYTHING_REQUEST_PATH);
+    
+    // 执行搜索
+    let results = searcher.query();
+
+    let mut result = Vec::new();
+    for item in results.iter() {
+        let name = item.filename().map_err(|e| e.to_string())?.to_string_lossy().into_owned();
+        let path = item.path().map_err(|e| e.to_string())?.to_string_lossy().into_owned();
+        let full_path = format!("{}\\{}", path, name);
+
+        result.push(FileEntry {
+            name,
+            path: full_path,
+            is_dir: true,
+            size: 0,
+        });
+    }
+    Ok(result)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
   tauri::Builder::default()
@@ -289,7 +351,9 @@ pub fn run() {
         get_tasks,
         save_task,
         run_migration,
-        restore_task
+        restore_task,
+        get_home_dir,
+        search_everything
     ])
     .setup(|_app| {
         Ok(())

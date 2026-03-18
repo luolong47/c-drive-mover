@@ -57,3 +57,11 @@ export async function runMigration(task_id: string): Promise<void> {
 export async function restoreTask(task_id: string): Promise<void> {
   await invoke('restore_task', { task_id });
 }
+
+export async function getHomeDir(): Promise<string> {
+  return await invoke('get_home_dir');
+}
+
+export async function searchEverything(query: string): Promise<FileEntry[]> {
+  return await invoke('search_everything', { query });
+}

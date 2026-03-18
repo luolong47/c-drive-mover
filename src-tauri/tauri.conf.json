@@ -13,10 +13,11 @@
     "windows": [
       {
         "title": "C Drive Mover",
-        "width": 800,
-        "height": 600,
+        "width": 1100,
+        "height": 820,
         "resizable": true,
-        "fullscreen": false
+        "fullscreen": false,
+        "center": true
       }
     ],
     "security": {
@@ -31,6 +32,7 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "windows": {}
   }
 }
