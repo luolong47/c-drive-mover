@@ -1,19 +1,68 @@
 'use client';
 
-import { Moon, Settings2, ShieldAlert, Sun } from 'lucide-react';
+import { FolderOpen, Loader2, Moon, Settings2, ShieldAlert, Sun } from 'lucide-react';
 import { useTheme } from 'next-themes';
 import { useEffect, useState } from 'react';
+import { getSettings, saveSettings, selectDirectory } from '@/lib/tauri-api';
 
 export default function SettingsPage() {
   const { theme, setTheme } = useTheme();
   const [mounted, setMounted] = useState(false);
+  const [defaultTargetBase, setDefaultTargetBase] = useState('D:\\Cdrive-Mover');
+  const [silentCheck, setSilentCheck] = useState(true);
+  const [isLoading, setIsLoading] = useState(true);
 
   useEffect(() => {
-    const timer = setTimeout(() => setMounted(true), 0);
-    return () => clearTimeout(timer);
+    const init = async () => {
+      try {
+        const settings = await getSettings();
+        setDefaultTargetBase(settings.default_target_base);
+        setSilentCheck(settings.silent_check);
+      } catch (err) {
+        console.error('Failed to load settings:', err);
+      } finally {
+        setIsLoading(false);
+        setMounted(true);
+      }
+    };
+    init();
   }, []);
 
-  if (!mounted) return null;
+  const handleSave = async (updates: { default_target_base?: string; silent_check?: boolean }) => {
+    const newBase = updates.default_target_base ?? defaultTargetBase;
+    const newCheck = updates.silent_check ?? silentCheck;
+
+    setDefaultTargetBase(newBase);
+    setSilentCheck(newCheck);
+
+    try {
+      await saveSettings({
+        default_target_base: newBase,
+        silent_check: newCheck,
+      });
+    } catch (err) {
+      console.error('Failed to save settings:', err);
+    }
+  };
+
+  const handleBrowse = async () => {
+    try {
+      const selected = await selectDirectory();
+      if (selected) {
+        handleSave({ default_target_base: selected });
+      }
+    } catch (err) {
+      console.error('Browse error:', err);
+    }
+  };
+
+  if (!mounted || isLoading) {
+    return (
+      <div className="h-full flex items-center justify-center">
+        <Loader2 size={32} className="animate-spin text-zinc-300" />
+      </div>
+    );
+  }
 
   return (
     <div className="p-8 max-w-4xl mx-auto">
@@ -61,17 +110,28 @@ export default function SettingsPage() {
                 htmlFor="target-drive"
                 className="block text-sm font-medium text-zinc-900 dark:text-zinc-100 mb-1"
               >
-                默认目标盘符
+                默认目标基础路径
               </label>
               <p className="text-xs text-zinc-500 dark:text-zinc-400 mb-3">
                 新建迁移方案时默认使用的目标基础路径
               </p>
-              <input
-                id="target-drive"
-                type="text"
-                defaultValue="D:\Cdata"
-                className="w-full max-w-md px-3 py-2 bg-zinc-50 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 text-zinc-900 dark:text-zinc-100 font-mono transition-colors"
-              />
+              <div className="flex gap-2 max-w-md">
+                <input
+                  id="target-drive"
+                  type="text"
+                  value={defaultTargetBase}
+                  onChange={(e) => handleSave({ default_target_base: e.target.value })}
+                  className="flex-1 px-3 py-2 bg-zinc-50 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 text-zinc-900 dark:text-zinc-100 font-mono transition-colors"
+                />
+                <button
+                  type="button"
+                  onClick={handleBrowse}
+                  className="p-2.5 bg-zinc-50 dark:bg-zinc-800 hover:bg-zinc-100 dark:hover:bg-zinc-700 text-zinc-600 dark:text-zinc-400 rounded-md transition-all flex items-center justify-center border border-zinc-200 dark:border-zinc-700 shadow-sm active:scale-95 shrink-0"
+                  title="选择目录"
+                >
+                  <FolderOpen size={18} />
+                </button>
+              </div>
             </div>
 
             <div className="flex items-center justify-between">
@@ -87,7 +147,13 @@ export default function SettingsPage() {
                 htmlFor="silent-check"
                 className="relative inline-flex items-center cursor-pointer"
               >
-                <input id="silent-check" type="checkbox" className="sr-only peer" defaultChecked />
+                <input
+                  id="silent-check"
+                  type="checkbox"
+                  className="sr-only peer"
+                  checked={silentCheck}
+                  onChange={(e) => handleSave({ silent_check: e.target.checked })}
+                />
                 <div className="w-11 h-6 bg-zinc-200 dark:bg-zinc-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-zinc-300 dark:after:border-zinc-600 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-indigo-500" />
               </label>
             </div>

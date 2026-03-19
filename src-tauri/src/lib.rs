@@ -46,14 +46,57 @@ pub struct MoveTask {
     pub finished_at: Option<i64>,
 }
 
-fn get_tasks_file() -> PathBuf {
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct AppSettings {
+    pub default_target_base: String,
+    pub silent_check: bool,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            default_target_base: "D:\\Cdrive-Mover".to_string(),
+            silent_check: true,
+        }
+    }
+}
+
+fn get_config_dir() -> PathBuf {
     let mut path = dirs::data_dir().unwrap_or_else(|| PathBuf::from("."));
     path.push("c-drive-mover");
     if !path.exists() {
         fs::create_dir_all(&path).ok();
     }
+    path
+}
+
+fn get_tasks_file() -> PathBuf {
+    let mut path = get_config_dir();
     path.push("tasks.json");
     path
+}
+
+fn get_settings_file() -> PathBuf {
+    let mut path = get_config_dir();
+    path.push("settings.json");
+    path
+}
+
+#[tauri::command]
+fn get_settings() -> AppSettings {
+    let path = get_settings_file();
+    if !path.exists() {
+        return AppSettings::default();
+    }
+    let content = fs::read_to_string(path).unwrap_or_default();
+    serde_json::from_str(&content).unwrap_or_else(|_| AppSettings::default())
+}
+
+#[tauri::command]
+fn save_settings(settings: AppSettings) -> Result<(), String> {
+    let content = serde_json::to_string(&settings).map_err(|e| e.to_string())?;
+    fs::write(get_settings_file(), content).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -362,7 +405,9 @@ pub fn run() {
         restore_task,
         get_home_dir,
         search_everything,
-        select_directory
+        select_directory,
+        get_settings,
+        save_settings
     ])
     .setup(|_app| {
         Ok(())

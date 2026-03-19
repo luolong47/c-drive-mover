@@ -30,6 +30,11 @@ export interface MoveTask {
   finished_at?: number;
 }
 
+export interface AppSettings {
+  default_target_base: string;
+  silent_check: boolean;
+}
+
 export async function getDiskInfo(): Promise<DiskInfo[]> {
   return await invoke('get_disk_info');
 }
@@ -68,4 +73,12 @@ export async function searchEverything(query: string): Promise<FileEntry[]> {
 
 export async function selectDirectory(): Promise<string | null> {
   return await invoke('select_directory');
+}
+
+export async function getSettings(): Promise<AppSettings> {
+  return await invoke('get_settings');
+}
+
+export async function saveSettings(settings: AppSettings): Promise<void> {
+  await invoke('save_settings', { settings });
 }

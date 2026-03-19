@@ -20,6 +20,7 @@ import {
   getDiskInfo,
   getFolderSize,
   getHomeDir,
+  getSettings,
   type MoveTask,
   saveTask,
   scanDirectory,
@@ -231,13 +232,27 @@ function useEverythingSearch(searchQuery: string, setExpandedNodes: (s: Set<stri
 function useInitialize(
   setTargetDisk: (d: DiskInfo | null) => void,
   setRootNodes: (n: FileNode[]) => void,
+  setTargetBase: (s: string) => void,
 ) {
   useEffect(() => {
     const init = async () => {
       try {
-        const [disks, homeDir] = await Promise.all([getDiskInfo(), getHomeDir()]);
-        const dDrive = disks.find((d) => d.mount_point.startsWith('D'));
-        if (dDrive) setTargetDisk(dDrive);
+        const [disks, homeDir, settings] = await Promise.all([
+          getDiskInfo(),
+          getHomeDir(),
+          getSettings(),
+        ]);
+
+        if (settings.default_target_base) {
+          setTargetBase(settings.default_target_base);
+          const drive = settings.default_target_base.split(':')[0].toUpperCase();
+          const disk = disks.find((d) => d.mount_point.startsWith(drive));
+          if (disk) setTargetDisk(disk);
+        } else {
+          const dDrive = disks.find((d) => d.mount_point.startsWith('D'));
+          if (dDrive) setTargetDisk(dDrive);
+        }
+
         const nodes = [homeDir].filter(Boolean).map((p) => ({
           id: p,
           name: p.split('\\').pop() || p,
@@ -252,7 +267,7 @@ function useInitialize(
       }
     };
     init();
-  }, [setTargetDisk, setRootNodes]);
+  }, [setTargetDisk, setRootNodes, setTargetBase]);
 }
 
 function useTaskStatistics(selectedPaths: Map<string, number>, targetDisk: DiskInfo | null) {
@@ -387,10 +402,10 @@ function TaskConfigurationSection({
   renderTree,
 }: TaskConfigurationSectionProps) {
   return (
-    <div className="lg:col-span-7 flex flex-col gap-6 min-h-0">
+    <div className="lg:col-span-7 flex flex-col gap-6 min-w-0">
       <div className="bg-zinc-100/80 dark:bg-zinc-900/50 border border-zinc-200/50 dark:border-zinc-800/50 rounded-2xl p-4 shrink-0 transition-colors">
-        <div className="grid grid-cols-2 gap-4">
-          <div>
+        <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
+          <div className="min-w-0">
             <label
               htmlFor="task-name"
               className="block text-xs font-medium text-zinc-700 dark:text-zinc-300 mb-1.5"
@@ -406,12 +421,12 @@ function TaskConfigurationSection({
               className="w-full px-3 py-2 bg-white dark:bg-zinc-900 border-none rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20 text-zinc-900 dark:text-zinc-100 transition-all font-mono"
             />
           </div>
-          <div>
+          <div className="min-w-0">
             <label
               htmlFor="target-base"
               className="block text-xs font-medium text-zinc-700 dark:text-zinc-300 mb-1.5"
             >
-              目标基础路径 (Target Base)
+              目标基础路径
             </label>
             <div className="flex gap-2">
               <input
@@ -420,16 +435,15 @@ function TaskConfigurationSection({
                 value={targetBase}
                 onChange={(e) => setTargetBase(e.target.value)}
                 placeholder="D:\Cdrive-Mover"
-                className="flex-1 px-3 py-2 bg-white dark:bg-zinc-900 border-none rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20 text-zinc-900 dark:text-zinc-100 transition-all font-mono"
+                className="flex-1 min-w-0 px-3 py-2 bg-white dark:bg-zinc-900 border-none rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20 text-zinc-900 dark:text-zinc-100 transition-all font-mono"
               />
               <button
                 type="button"
                 onClick={handleBrowse}
-                className="px-3 py-2 bg-white dark:bg-zinc-900 hover:bg-zinc-50 dark:hover:bg-zinc-800 text-zinc-600 dark:text-zinc-400 rounded-md transition-all flex items-center gap-1.5 border-none shadow-sm hover:shadow-md active:scale-95"
+                className="p-2.5 bg-white dark:bg-zinc-900 hover:bg-zinc-50 dark:hover:bg-zinc-800 text-zinc-600 dark:text-zinc-400 rounded-md transition-all flex items-center justify-center border-none shadow-sm hover:shadow-md active:scale-95 shrink-0"
                 title="选择目录"
               >
-                <FolderOpen size={16} />
-                <span className="text-xs font-medium">浏览</span>
+                <FolderOpen size={18} />
               </button>
             </div>
           </div>
@@ -502,7 +516,7 @@ function TaskPreviewSection({
   taskName,
 }: TaskPreviewSectionProps) {
   return (
-    <div className="lg:col-span-5 flex flex-col gap-6 min-h-0">
+    <div className="lg:col-span-5 flex flex-col gap-6 min-w-0">
       <div
         className={`bg-zinc-100/80 dark:bg-zinc-900/50 border border-zinc-200/50 dark:border-zinc-800/50 rounded-2xl p-4 shrink-0 transition-colors ${totalSize > freeSpace ? 'bg-red-100/60 dark:bg-red-500/10 border-red-200 dark:border-red-500/20' : ''}`}
       >
@@ -761,7 +775,7 @@ export default function CreateTaskPage() {
     router,
   );
 
-  useInitialize(setTargetDisk, setRootNodes);
+  useInitialize(setTargetDisk, setRootNodes, setTargetBase);
 
   const isAnyLoading = useMemo(
     () =>
