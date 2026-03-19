@@ -62,8 +62,11 @@ impl Default for AppSettings {
 }
 
 fn get_config_dir() -> PathBuf {
-    let mut path = dirs::data_dir().unwrap_or_else(|| PathBuf::from("."));
-    path.push("c-drive-mover");
+    let mut path = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."));
+    path.push("Data");
     if !path.exists() {
         fs::create_dir_all(&path).ok();
     }
