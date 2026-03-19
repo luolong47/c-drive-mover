@@ -33,6 +33,8 @@ interface FileNode extends FileEntry {
   id: string;
   children?: FileNode[];
   loading?: boolean;
+  segments?: { name: string; path: string }[];
+  is_match?: boolean;
 }
 
 // --- 工具函数 ---
@@ -85,7 +87,10 @@ function processPath(
 
     const node = getOrCreateNode(allNodes, currentPath, part, roots, parent);
     if (!foundFirstMatch && parent) parentPaths.add(parent.id);
-    if (part.toLowerCase().includes(query.toLowerCase())) foundFirstMatch = true;
+    if (part.toLowerCase().includes(query.toLowerCase())) {
+      foundFirstMatch = true;
+      node.is_match = true;
+    }
     parent = node;
   }
 }
@@ -104,23 +109,34 @@ function buildTreeFromPaths(
   return { roots, parentPaths };
 }
 
-// 合并单子节点目录以实现紧凑展示
+// 合并单子节点目录以实现紧凑展示，同时保留路径段以便独立勾选
 function compactNodes(nodes: FileNode[]): FileNode[] {
   return nodes.map((node) => {
     const current = { ...node };
+
+    // 初始化片段信息
+    if (!current.segments) {
+      current.segments = [{ name: current.name, path: current.path }];
+    }
+
+    // 处理子节点递归（先递归处理，再尝试向上合并）
     if (current.children && current.children.length > 0) {
       current.children = compactNodes(current.children);
     }
 
-    // 如果只有一个子节点，则合并
+    // 如果只有一个子节点，且当前节点和子节点都不是搜索直接匹配项，则尝试合并
     if (current.children && current.children.length === 1) {
       const child = current.children[0];
-      const sep = current.name.endsWith('\\') ? '' : '\\';
-      return {
-        ...child,
-        name: `${current.name}${sep}${child.name}`,
-      };
+      if (!current.is_match && !child.is_match) {
+        const sep = current.name.endsWith('\\') ? '' : '\\';
+        return {
+          ...child,
+          name: `${current.name}${sep}${child.name}`,
+          segments: [...(current.segments || []), ...(child.segments || [])],
+        };
+      }
     }
+
     return current;
   });
 }
@@ -189,9 +205,38 @@ function TreeNode({
             <Square size={16} />
           )}
         </button>
-        <span className="text-sm font-medium text-zinc-700 dark:text-zinc-300 truncate">
-          {node.name}
-        </span>
+        <div className="text-sm font-medium text-zinc-700 dark:text-zinc-300 truncate flex items-center gap-1">
+          {node.segments ? (
+            node.segments.map((seg, i) => (
+              <div key={seg.path} className="flex items-center gap-1">
+                <button
+                  type="button"
+                  className={`px-1 rounded transition-colors cursor-pointer outline-none focus:ring-1 focus:ring-indigo-500/50 ${
+                    seg.name.toLowerCase().includes(searchQuery.toLowerCase())
+                      ? 'bg-amber-100 dark:bg-amber-900/40 text-amber-900 dark:text-amber-100'
+                      : 'hover:bg-zinc-100 dark:hover:bg-zinc-800'
+                  } ${
+                    selectedPaths.has(seg.path)
+                      ? 'text-indigo-600 dark:text-indigo-400 font-bold'
+                      : ''
+                  }`}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    toggleSelection(seg.path);
+                  }}
+                  title={seg.path}
+                >
+                  {seg.name}
+                </button>
+                {i < (node.segments?.length || 0) - 1 && (
+                  <span className="text-zinc-400 dark:text-zinc-600 text-xs">\</span>
+                )}
+              </div>
+            ))
+          ) : (
+            <span>{node.name}</span>
+          )}
+        </div>
       </button>
       {node.children && isExpanded && <div>{renderTree(node.children, depth + 1)}</div>}
     </div>
@@ -297,6 +342,8 @@ function useTaskActions(
   targetBase: string,
   setIsSaving: (b: boolean) => void,
   router: ReturnType<typeof useRouter>,
+  isBlacklisted: (path: string) => boolean,
+  setError: (s: string | null) => void,
 ) {
   const loadDirectory = async (node: FileNode) => {
     if (node.children?.length || node.loading) return;
@@ -337,6 +384,12 @@ function useTaskActions(
     setExpandedNodes(next);
   };
   const toggleSelection = async (path: string) => {
+    if (isBlacklisted(path)) {
+      setError(`该路径已在黑名单中，禁止迁移：${path}`);
+      setTimeout(() => setError(null), 3000);
+      return;
+    }
+    setError(null);
     const next = new Map(selectedPaths);
     if (next.has(path)) next.delete(path);
     else {
@@ -351,6 +404,15 @@ function useTaskActions(
   };
   const handleSave = async () => {
     if (!taskName || selectedPaths.size === 0 || !targetBase) return;
+
+    // 二次确认黑名单
+    for (const path of selectedPaths.keys()) {
+      if (isBlacklisted(path)) {
+        setError(`路径 ${path} 在黑名单中，无法保存方案。`);
+        return;
+      }
+    }
+
     setIsSaving(true);
     try {
       const task: MoveTask = {
@@ -479,7 +541,7 @@ function TaskConfigurationSection({
             displayRoots.length === 0 && !isSearching ? (
               <div className="h-full flex flex-col items-center justify-center text-zinc-400 dark:text-zinc-600 py-12">
                 <Search size={32} className="mb-2 opacity-50" />
-                <p className="text-xs">未找到匹配目录 (需运行 Everything 服务)</p>
+                <p className="text-xs">未找到匹配目录 (请确保输入的路径正确)</p>
               </div>
             ) : (
               renderTree(displayRoots)
@@ -636,6 +698,7 @@ interface CreateTaskViewProps {
   handleBrowse: () => void;
   renderTree: (nodes: FileNode[], depth?: number) => React.ReactNode;
   isAnyLoading: boolean;
+  error: string | null;
 }
 
 function CreateTaskView({
@@ -658,6 +721,7 @@ function CreateTaskView({
   handleBrowse,
   renderTree,
   isAnyLoading,
+  error,
 }: CreateTaskViewProps) {
   return (
     <div className="p-8 max-w-6xl mx-auto h-full flex flex-col">
@@ -693,6 +757,13 @@ function CreateTaskView({
           </button>
         </div>
       </header>
+
+      {error && (
+        <div className="mb-6 bg-red-50 dark:bg-red-500/10 border border-red-100 dark:border-red-500/20 rounded-xl p-4 flex items-start gap-3 animate-in fade-in slide-in-from-top-2 duration-300">
+          <AlertTriangle className="text-red-600 dark:text-red-400 shrink-0 mt-0.5" size={18} />
+          <p className="text-sm font-medium text-red-800 dark:text-red-300">{error}</p>
+        </div>
+      )}
 
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 flex-1 min-h-0">
         <TaskConfigurationSection
@@ -733,12 +804,15 @@ export default function CreateTaskPage() {
   const [expandedNodes, setExpandedNodes] = useState<Set<string>>(new Set());
   const [isSaving, setIsSaving] = useState(false);
   const [targetDisk, setTargetDisk] = useState<DiskInfo | null>(null);
+  const [blacklist, setBlacklist] = useState<string[]>([]);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     const syncDisk = async () => {
       if (!targetBase) return;
       try {
-        const disks = await getDiskInfo();
+        const [disks, settings] = await Promise.all([getDiskInfo(), getSettings()]);
+        setBlacklist(settings.blacklist || []);
         const drive = targetBase.split(':')[0].toUpperCase();
         const disk = disks.find((d) => d.mount_point.startsWith(drive));
         if (disk) setTargetDisk(disk);
@@ -748,6 +822,14 @@ export default function CreateTaskPage() {
     };
     syncDisk();
   }, [targetBase]);
+
+  const isBlacklisted = (path: string) => {
+    return blacklist.some((b) => {
+      const bLower = b.toLowerCase().replace(/\\$/, '');
+      const pLower = path.toLowerCase().replace(/\\$/, '');
+      return pLower === bLower || pLower.startsWith(`${bLower}\\`);
+    });
+  };
 
   const handleBrowse = async () => {
     try {
@@ -773,6 +855,8 @@ export default function CreateTaskPage() {
     targetBase,
     setIsSaving,
     router,
+    isBlacklisted,
+    setError,
   );
 
   useInitialize(setTargetDisk, setRootNodes, setTargetBase);
@@ -828,6 +912,7 @@ export default function CreateTaskPage() {
       handleBrowse={handleBrowse}
       renderTree={renderTree}
       isAnyLoading={isAnyLoading}
+      error={error}
     />
   );
 }

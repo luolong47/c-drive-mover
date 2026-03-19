@@ -33,6 +33,7 @@ export interface MoveTask {
 export interface AppSettings {
   default_target_base: string;
   silent_check: boolean;
+  blacklist: string[];
 }
 
 export async function getDiskInfo(): Promise<DiskInfo[]> {

@@ -50,6 +50,7 @@ pub struct MoveTask {
 pub struct AppSettings {
     pub default_target_base: String,
     pub silent_check: bool,
+    pub blacklist: Vec<String>,
 }
 
 impl Default for AppSettings {
@@ -57,6 +58,11 @@ impl Default for AppSettings {
         Self {
             default_target_base: "D:\\Cdrive-Mover".to_string(),
             silent_check: true,
+            blacklist: vec![
+                "C:\\Windows".to_string(),
+                "C:\\Program Files".to_string(),
+                "C:\\Program Files (x86)".to_string(),
+            ],
         }
     }
 }
@@ -345,45 +351,129 @@ fn get_home_dir() -> String {
 fn search_everything(query: String) -> Result<Vec<FileEntry>, String> {
     use everything_sdk::{global, RequestFlags};
 
-    // 获取用户主目录作为搜索基准
     let home_dir = dirs::home_dir()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|| "C:\\Users".to_string());
 
-    // 获取 Everything 全局锁
-    let mut everything = global().try_lock().map_err(|_| "无法获取 Everything 锁，请检查是否已启动 Everything 且没有其他查询正在运行")?;
-    
-    // 检查数据库是否加载
-    if !everything.is_db_loaded().map_err(|e| e.to_string())? {
-        return Err("Everything 数据库尚未加载完成".to_string());
+    // 尝试使用 Everything SDK
+    let results = (|| -> Result<Vec<FileEntry>, String> {
+        let mut everything = global()
+            .try_lock()
+            .map_err(|_| "Service not running".to_string())?;
+
+        if !everything.is_db_loaded().map_err(|e| e.to_string())? {
+            return Err("DB not loaded".to_string());
+        }
+
+        let mut searcher = everything.searcher();
+        let temp_exclude = format!("{}\\AppData\\Local\\Temp", home_dir);
+
+        searcher
+            .set_search(&format!("\"{}\" !\"{}\" folder: *{}*", home_dir, temp_exclude, query))
+            .set_max(100)
+            .set_request_flags(
+                RequestFlags::EVERYTHING_REQUEST_FILE_NAME | RequestFlags::EVERYTHING_REQUEST_PATH,
+            );
+
+        let query_results = searcher.query();
+        let mut result = Vec::new();
+        for item in query_results.iter() {
+            let name = item.filename().map_err(|e| e.to_string())?.to_string_lossy().into_owned();
+            let path = item.path().map_err(|e| e.to_string())?.to_string_lossy().into_owned();
+            let full_path = format!("{}\\{}", path, name);
+            
+            result.push(FileEntry {
+                name,
+                path: full_path,
+                is_dir: true,
+                size: 0,
+            });
+        }
+        Ok(result)
+    })();
+
+    match results {
+        Ok(res) if !res.is_empty() => Ok(res),
+        _ => {
+            // 降级逻辑
+            Ok(search_fallback(&home_dir, &query))
+        }
+    }
+}
+
+fn search_fallback(home_dir: &str, query: &str) -> Vec<FileEntry> {
+    let mut result = Vec::new();
+    let query_lower = query.to_lowercase();
+
+    // 1. 尝试使用 busybox find (如果用户环境有安装)
+    // 语法: busybox find [path] -maxdepth 4 -type d -iname "*query*"
+    let mut command = std::process::Command::new("busybox");
+    command.args([
+        "find",
+        home_dir,
+        "-maxdepth",
+        "4",
+        "-type",
+        "d",
+        "-iname",
+        &format!("*{}*", query),
+    ]);
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        command.creation_flags(CREATE_NO_WINDOW);
     }
 
-    let mut searcher = everything.searcher();
+    let output = command.output();
+
+    if let Ok(output) = output {
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines().take(100) {
+                let path = Path::new(line);
+                if let Some(name) = path.file_name() {
+                    result.push(FileEntry {
+                        name: name.to_string_lossy().into_owned(),
+                        path: line.to_string(),
+                        is_dir: true,
+                        size: 0,
+                    });
+                }
+            }
+            if !result.is_empty() {
+                return result;
+            }
+        }
+    }
+
+    // 2. 最终降级：使用 Rust 原生 WalkDir 进行有限深度的扫描
+    let temp_exclude = format!("{}\\AppData\\Local\\Temp", home_dir).to_lowercase();
     
-    let temp_exclude = format!("{}\\AppData\\Local\\Temp", home_dir);
-
-    // 限制在主目录下搜索文件夹，并排除 Temp 目录
-    searcher.set_search(&format!("\"{}\" !\"{}\" folder: {}", home_dir, temp_exclude, query))
-            .set_max(100)
-            .set_request_flags(RequestFlags::EVERYTHING_REQUEST_FILE_NAME | RequestFlags::EVERYTHING_REQUEST_PATH);
-    
-    // 执行搜索
-    let results = searcher.query();
-
-    let mut result = Vec::new();
-    for item in results.iter() {
-        let name = item.filename().map_err(|e| e.to_string())?.to_string_lossy().into_owned();
-        let path = item.path().map_err(|e| e.to_string())?.to_string_lossy().into_owned();
-        let full_path = format!("{}\\{}", path, name);
-
-        result.push(FileEntry {
-            name,
-            path: full_path,
+    WalkDir::new(home_dir)
+        .max_depth(4)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            let path_str = e.path().to_string_lossy().to_lowercase();
+            // 排除 Temp 目录，但允许隐藏目录（如 .pnpm）
+            e.file_type().is_dir() && !path_str.starts_with(&temp_exclude)
+        })
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .to_lowercase()
+                .contains(&query_lower)
+        })
+        .take(100)
+        .map(|e| FileEntry {
+            name: e.file_name().to_string_lossy().into_owned(),
+            path: e.path().to_string_lossy().into_owned(),
             is_dir: true,
             size: 0,
-        });
-    }
-    Ok(result)
+        })
+        .collect()
 }
 
 #[tauri::command]

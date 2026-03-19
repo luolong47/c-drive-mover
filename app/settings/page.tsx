@@ -1,6 +1,18 @@
 'use client';
 
-import { FolderOpen, Loader2, Moon, Settings2, ShieldAlert, Sun } from 'lucide-react';
+import {
+  Edit2,
+  FolderOpen,
+  Loader2,
+  Lock,
+  Moon,
+  Plus,
+  Settings2,
+  ShieldAlert,
+  Sun,
+  Trash2,
+  Unlock,
+} from 'lucide-react';
 import { useTheme } from 'next-themes';
 import { useEffect, useState } from 'react';
 import { getSettings, saveSettings, selectDirectory } from '@/lib/tauri-api';
@@ -10,6 +22,9 @@ export default function SettingsPage() {
   const [mounted, setMounted] = useState(false);
   const [defaultTargetBase, setDefaultTargetBase] = useState('D:\\Cdrive-Mover');
   const [silentCheck, setSilentCheck] = useState(true);
+  const [blacklist, setBlacklist] = useState<string[]>([]);
+  const [isLocked, setIsLocked] = useState(true);
+  const [selectedBlacklistIndex, setSelectedBlacklistIndex] = useState<number | null>(null);
   const [isLoading, setIsLoading] = useState(true);
 
   useEffect(() => {
@@ -18,6 +33,7 @@ export default function SettingsPage() {
         const settings = await getSettings();
         setDefaultTargetBase(settings.default_target_base);
         setSilentCheck(settings.silent_check);
+        setBlacklist(settings.blacklist || []);
       } catch (err) {
         console.error('Failed to load settings:', err);
       } finally {
@@ -28,17 +44,24 @@ export default function SettingsPage() {
     init();
   }, []);
 
-  const handleSave = async (updates: { default_target_base?: string; silent_check?: boolean }) => {
+  const handleSave = async (updates: {
+    default_target_base?: string;
+    silent_check?: boolean;
+    blacklist?: string[];
+  }) => {
     const newBase = updates.default_target_base ?? defaultTargetBase;
     const newCheck = updates.silent_check ?? silentCheck;
+    const newBlacklist = updates.blacklist ?? blacklist;
 
     setDefaultTargetBase(newBase);
     setSilentCheck(newCheck);
+    setBlacklist(newBlacklist);
 
     try {
       await saveSettings({
         default_target_base: newBase,
         silent_check: newCheck,
+        blacklist: newBlacklist,
       });
     } catch (err) {
       console.error('Failed to save settings:', err);
@@ -53,6 +76,32 @@ export default function SettingsPage() {
       }
     } catch (err) {
       console.error('Browse error:', err);
+    }
+  };
+
+  const handleAddBlacklist = async () => {
+    const selected = await selectDirectory();
+    if (selected && !blacklist.includes(selected)) {
+      handleSave({ blacklist: [...blacklist, selected] });
+    }
+  };
+
+  const handleDeleteBlacklist = () => {
+    if (selectedBlacklistIndex !== null) {
+      const newList = blacklist.filter((_, i) => i !== selectedBlacklistIndex);
+      handleSave({ blacklist: newList });
+      setSelectedBlacklistIndex(null);
+    }
+  };
+
+  const handleEditBlacklist = async () => {
+    if (selectedBlacklistIndex !== null) {
+      const selected = await selectDirectory();
+      if (selected) {
+        const newList = [...blacklist];
+        newList[selectedBlacklistIndex] = selected;
+        handleSave({ blacklist: newList });
+      }
     }
   };
 
@@ -162,51 +211,92 @@ export default function SettingsPage() {
 
         {/* Security Settings */}
         <section className="bg-zinc-200/60 dark:bg-zinc-800/60 rounded-2xl p-2 transition-colors">
-          <div className="px-3 py-2.5 flex items-center gap-2">
-            <ShieldAlert size={18} className="text-amber-500" />
-            <h2 className="text-sm font-medium text-zinc-900 dark:text-zinc-100">高级保护策略</h2>
-          </div>
-          <div className="bg-white dark:bg-zinc-900 rounded-xl p-6 space-y-8 transition-colors">
-            <div className="flex items-center justify-between">
-              <div>
-                <h3 className="text-sm font-medium text-zinc-900 dark:text-zinc-100">
-                  系统核心目录黑名单保护
-                </h3>
-                <p className="text-xs text-zinc-500 dark:text-zinc-400 mt-1">
-                  禁止迁移 C:\Windows, C:\Program Files 等核心路径，防止系统崩溃
-                </p>
-              </div>
-              <label
-                htmlFor="core-protect"
-                className="relative inline-flex items-center cursor-not-allowed opacity-70"
-              >
-                <input
-                  id="core-protect"
-                  type="checkbox"
-                  className="sr-only peer"
-                  checked
-                  disabled
-                />
-                <div className="w-11 h-6 bg-emerald-400 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-zinc-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all" />
-              </label>
+          <div className="px-3 py-2.5 flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <ShieldAlert size={18} className="text-amber-500" />
+              <h2 className="text-sm font-medium text-zinc-900 dark:text-zinc-100">高级保护策略</h2>
             </div>
-
+            <button
+              type="button"
+              onClick={() => setIsLocked(!isLocked)}
+              className={`p-1.5 rounded-md transition-all flex items-center gap-1.5 text-xs font-medium ${isLocked ? 'bg-zinc-100 dark:bg-zinc-800 text-zinc-500 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100' : 'bg-amber-100 dark:bg-amber-900/30 text-amber-600 dark:text-amber-400 shadow-sm'}`}
+              title={isLocked ? '点击解锁以编辑' : '点击锁定'}
+            >
+              {isLocked ? (
+                <>
+                  <Lock size={14} /> 锁定
+                </>
+              ) : (
+                <>
+                  <Unlock size={14} /> 已解锁
+                </>
+              )}
+            </button>
+          </div>
+          <div className="bg-white dark:bg-zinc-900 rounded-xl p-6 space-y-6 transition-colors">
             <div>
-              <label
-                htmlFor="blacklist-paths"
-                className="block text-sm font-medium text-zinc-900 dark:text-zinc-100 mb-3"
+              <div className="flex items-center justify-between mb-3">
+                <div className="text-sm font-medium text-zinc-900 dark:text-zinc-100">
+                  自定义黑名单路径
+                </div>
+                {!isLocked && (
+                  <div className="flex gap-2">
+                    <button
+                      type="button"
+                      onClick={handleAddBlacklist}
+                      className="p-1.5 text-zinc-500 hover:text-indigo-600 dark:text-zinc-400 dark:hover:text-indigo-400 transition-colors"
+                      title="新建"
+                    >
+                      <Plus size={16} />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleEditBlacklist}
+                      disabled={selectedBlacklistIndex === null}
+                      className="p-1.5 text-zinc-500 hover:text-indigo-600 dark:text-zinc-400 dark:hover:text-indigo-400 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+                      title="编辑"
+                    >
+                      <Edit2 size={16} />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleDeleteBlacklist}
+                      disabled={selectedBlacklistIndex === null}
+                      className="p-1.5 text-zinc-500 hover:text-red-600 dark:text-zinc-400 dark:hover:text-red-400 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+                      title="删除"
+                    >
+                      <Trash2 size={16} />
+                    </button>
+                  </div>
+                )}
+              </div>
+
+              <div
+                className={`w-full min-h-32 bg-zinc-50 dark:bg-zinc-800 border ${isLocked ? 'border-zinc-100 dark:border-zinc-700/50' : 'border-indigo-500/30 ring-2 ring-indigo-500/5'} rounded-lg transition-all overflow-hidden`}
               >
-                自定义黑名单路径
-              </label>
-              <textarea
-                id="blacklist-paths"
-                rows={3}
-                defaultValue="C:\Windows&#10;C:\Program Files&#10;C:\Program Files (x86)"
-                className="w-full px-4 py-3 bg-zinc-50 dark:bg-zinc-800 border border-zinc-100 dark:border-zinc-700 rounded-lg text-sm focus:outline-none font-mono text-zinc-600 dark:text-zinc-400 resize-none transition-colors"
-                disabled
-              />
-              <p className="text-[10px] text-amber-600 dark:text-amber-500 mt-2">
-                内置保护规则不可修改
+                <div className="h-48 overflow-y-auto custom-scrollbar">
+                  {blacklist.length === 0 ? (
+                    <div className="h-full flex items-center justify-center text-zinc-400 dark:text-zinc-600 italic text-xs">
+                      暂无黑名单路径
+                    </div>
+                  ) : (
+                    <div className="divide-y divide-zinc-100 dark:divide-zinc-700/50">
+                      {blacklist.map((path, index) => (
+                        <button
+                          key={path}
+                          type="button"
+                          onClick={() => !isLocked && setSelectedBlacklistIndex(index)}
+                          className={`w-full text-left px-4 py-2 text-sm font-mono truncate transition-colors ${selectedBlacklistIndex === index ? 'bg-indigo-50 dark:bg-indigo-500/10 text-indigo-600 dark:text-indigo-400' : 'text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100/50 dark:hover:bg-zinc-700/30'}`}
+                        >
+                          {path}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+              <p className="text-[10px] text-zinc-500 dark:text-zinc-400 mt-2">
+                处于黑名单中的目录将被禁止迁移。内置规则不可修改。
               </p>
             </div>
           </div>
