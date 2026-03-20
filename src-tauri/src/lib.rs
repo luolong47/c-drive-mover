@@ -43,6 +43,7 @@ pub struct MoveTask {
     pub id: String,
     pub name: String,
     pub target_base: String,
+    pub common_prefix: String,
     pub sources: Vec<TaskSource>,
     pub status: String, // "pending", "running", "success", "failed"
     pub error: Option<String>,
@@ -191,7 +192,7 @@ fn get_tasks(db: State<DbState>) -> Result<Vec<MoveTask>, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
     let mut stmt = conn
         .prepare(
-            "SELECT id, name, target_base, status, error, created_at, finished_at FROM tasks ORDER BY created_at DESC",
+            "SELECT id, name, target_base, common_prefix, status, error, created_at, finished_at FROM tasks ORDER BY created_at DESC",
         )
         .map_err(|e| e.to_string())?;
 
@@ -201,10 +202,11 @@ fn get_tasks(db: State<DbState>) -> Result<Vec<MoveTask>, String> {
                 id: row.get(0)?,
                 name: row.get(1)?,
                 target_base: row.get(2)?,
-                status: row.get(3)?,
-                error: row.get(4)?,
-                created_at: row.get(5)?,
-                finished_at: row.get(6)?,
+                common_prefix: row.get(3)?,
+                status: row.get(4)?,
+                error: row.get(5)?,
+                created_at: row.get(6)?,
+                finished_at: row.get(7)?,
                 sources: Vec::new(),
             })
         })
@@ -240,11 +242,12 @@ fn save_task(db: State<DbState>, task: MoveTask) -> Result<(), String> {
     let tx = conn.transaction().map_err(|e| e.to_string())?;
 
     tx.execute(
-        "INSERT INTO tasks (id, name, target_base, status, error, created_at, finished_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        "INSERT INTO tasks (id, name, target_base, common_prefix, status, error, created_at, finished_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
          ON CONFLICT(id) DO UPDATE SET
             name=excluded.name,
             target_base=excluded.target_base,
+            common_prefix=excluded.common_prefix,
             status=excluded.status,
             error=excluded.error,
             finished_at=excluded.finished_at",
@@ -252,6 +255,7 @@ fn save_task(db: State<DbState>, task: MoveTask) -> Result<(), String> {
             task.id,
             task.name,
             task.target_base,
+            task.common_prefix,
             task.status,
             task.error,
             task.created_at,
@@ -305,7 +309,7 @@ async fn run_migration(
             e.to_string()
         })?;
         let mut stmt = conn
-            .prepare("SELECT id, name, target_base, status, error, created_at, finished_at FROM tasks WHERE id = ?")
+            .prepare("SELECT id, name, target_base, common_prefix, status, error, created_at, finished_at FROM tasks WHERE id = ?")
             .map_err(|e| e.to_string())?;
 
         let mut task = stmt.query_row([&task_id], |row| {
@@ -313,13 +317,15 @@ async fn run_migration(
                 id: row.get(0)?,
                 name: row.get(1)?,
                 target_base: row.get(2)?,
-                status: row.get(3)?,
-                error: row.get(4)?,
-                created_at: row.get(5)?,
-                finished_at: row.get(6)?,
+                common_prefix: row.get(3)?,
+                status: row.get(4)?,
+                error: row.get(5)?,
+                created_at: row.get(6)?,
+                finished_at: row.get(7)?,
                 sources: Vec::new(),
             })
-        }).map_err(|e| {
+        })
+.map_err(|e| {
             log::error!("Task {} not found in database: {}", task_id, e);
             "找不到指定的迁移任务".to_string()
         })?;
@@ -368,8 +374,17 @@ async fn run_migration(
 
     for source in &task.sources {
         let source_path = Path::new(&source.path);
-        let folder_name = source_path.file_name().ok_or("无效的源路径")?;
-        let target_path = target_root.join(folder_name);
+        
+        // 计算相对路径：如果定义了公共前缀，则保留前缀之后的层级；否则仅使用文件夹名
+        let rel_path = if !task.common_prefix.is_empty() && source.path.starts_with(&task.common_prefix) {
+            &source.path[task.common_prefix.len()..]
+        } else {
+            source_path.file_name().ok_or("无效的源路径")?.to_str().ok_or("路径编码错误")?
+        };
+        
+        // 清理相对路径开头的斜杠
+        let rel_path = rel_path.trim_start_matches('\\').trim_start_matches('/');
+        let target_path = target_root.join(rel_path);
 
         emit_log(
             &app_handle,
@@ -388,7 +403,7 @@ async fn run_migration(
 
         if let Some(parent) = target_path.parent() {
             if !parent.exists() {
-                log::info!("Creating parent directory: {:?}", parent);
+                log::info!("Creating target parent directory: {:?}", parent);
                 if let Err(e) = fs::create_dir_all(parent) {
                     has_error = true;
                     error_msg = format!("无法创建目标父目录 {:?}: {}", parent, e);
@@ -410,7 +425,11 @@ async fn run_migration(
         emit_log(&app_handle, "正在移动目录文件...".to_string(), "info");
         log::info!("Moving directory...");
         let options = fs_extra::dir::CopyOptions::new().content_only(false);
-        if let Err(e) = fs_extra::dir::move_dir(source_path, &target_root, &options) {
+        
+        // 注意：fs_extra::move_dir(src, dest, options) 会将 src 移动到 dest 目录下
+        // 所以我们需要移动到 target_path 的父目录
+        let target_parent = target_path.parent().ok_or("无效的目标路径")?;
+        if let Err(e) = fs_extra::dir::move_dir(source_path, target_parent, &options) {
             has_error = true;
             error_msg = format!("无法移动目录 {}: {}. 请确保没有程序正在使用该目录。", source.path, e);
             emit_log(&app_handle, error_msg.clone(), "error");
@@ -474,7 +493,7 @@ async fn restore_task(
             e.to_string()
         })?;
         let mut stmt = conn
-            .prepare("SELECT id, name, target_base, status, error, created_at, finished_at FROM tasks WHERE id = ?")
+            .prepare("SELECT id, name, target_base, common_prefix, status, error, created_at, finished_at FROM tasks WHERE id = ?")
             .map_err(|e| e.to_string())?;
 
         let mut task = stmt.query_row([&task_id], |row| {
@@ -482,13 +501,15 @@ async fn restore_task(
                 id: row.get(0)?,
                 name: row.get(1)?,
                 target_base: row.get(2)?,
-                status: row.get(3)?,
-                error: row.get(4)?,
-                created_at: row.get(5)?,
-                finished_at: row.get(6)?,
+                common_prefix: row.get(3)?,
+                status: row.get(4)?,
+                error: row.get(5)?,
+                created_at: row.get(6)?,
+                finished_at: row.get(7)?,
                 sources: Vec::new(),
             })
-        }).map_err(|e| {
+        })
+.map_err(|e| {
             log::error!("Task {} not found: {}", task_id, e);
             "找不到指定的迁移任务".to_string()
         })?;
@@ -528,8 +549,17 @@ async fn restore_task(
 
     for source in &task.sources {
         let source_path = Path::new(&source.path);
-        let folder_name = source_path.file_name().ok_or("无效的路径")?;
-        let target_path = target_root.join(folder_name);
+        
+        // 计算相对路径：如果定义了公共前缀，则保留前缀之后的层级；否则仅使用文件夹名
+        let rel_path = if !task.common_prefix.is_empty() && source.path.starts_with(&task.common_prefix) {
+            &source.path[task.common_prefix.len()..]
+        } else {
+            source_path.file_name().ok_or("无效的源路径")?.to_str().ok_or("路径编码错误")?
+        };
+        
+        // 清理相对路径开头的斜杠
+        let rel_path = rel_path.trim_start_matches('\\').trim_start_matches('/');
+        let target_path = target_root.join(rel_path);
 
         emit_log(&app_handle, format!("正在还原: {}", source.path), "info");
         log::info!("Restoring source: {:?} <- {:?}", source_path, target_path);
@@ -771,6 +801,7 @@ fn init_db(app_handle: &AppHandle) -> Result<(), String> {
             id TEXT PRIMARY KEY,
             name TEXT NOT NULL,
             target_base TEXT NOT NULL,
+            common_prefix TEXT NOT NULL DEFAULT '',
             status TEXT NOT NULL,
             error TEXT,
             created_at INTEGER NOT NULL,
@@ -779,6 +810,23 @@ fn init_db(app_handle: &AppHandle) -> Result<(), String> {
         [],
     )
     .map_err(|e| e.to_string())?;
+
+    // Check if common_prefix column exists, if not, add it
+    {
+        let mut stmt = conn.prepare("PRAGMA table_info(tasks)").map_err(|e| e.to_string())?;
+        let mut has_common_prefix = false;
+        let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
+        while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+            let name: String = row.get(1).map_err(|e| e.to_string())?;
+            if name == "common_prefix" {
+                has_common_prefix = true;
+                break;
+            }
+        }
+        if !has_common_prefix {
+            conn.execute("ALTER TABLE tasks ADD COLUMN common_prefix TEXT NOT NULL DEFAULT ''", []).map_err(|e| e.to_string())?;
+        }
+    }
 
     conn.execute(
         "CREATE TABLE IF NOT EXISTS task_sources (
@@ -808,6 +856,7 @@ fn init_db(app_handle: &AppHandle) -> Result<(), String> {
                         id: row.get(0)?,
                         name: row.get(1)?,
                         target_base: row.get(2)?,
+                        common_prefix: String::new(), // 旧数据默认为空
                         status: row.get(3)?,
                         error: row.get(4)?,
                         created_at: row.get(5)?,
@@ -819,8 +868,8 @@ fn init_db(app_handle: &AppHandle) -> Result<(), String> {
                  if let Some(iter) = tasks_iter {
                      for task in iter.filter_map(|t| t.ok()) {
                          // Insert task
-                         conn.execute("INSERT OR IGNORE INTO tasks (id, name, target_base, status, error, created_at, finished_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                            params![task.id, task.name, task.target_base, task.status, task.error, task.created_at, task.finished_at]).ok();
+                         conn.execute("INSERT OR IGNORE INTO tasks (id, name, target_base, common_prefix, status, error, created_at, finished_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                            params![task.id, task.name, task.target_base, task.common_prefix, task.status, task.error, task.created_at, task.finished_at]).ok();
                          
                          // Migrate sources
                          let src_stmt = old_conn.prepare("SELECT path, size FROM task_sources WHERE task_id = ?").ok();

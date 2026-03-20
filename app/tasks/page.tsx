@@ -208,20 +208,37 @@ export default function TasksPage() {
                   <p className="text-xs font-medium text-zinc-500 dark:text-zinc-400 mb-2">
                     源目录 ({task.sources.length})
                   </p>
-                  <div className="space-y-1.5">
-                    {task.sources.map((source) => (
-                      <div
-                        key={source.path}
-                        className="flex justify-between items-center text-xs font-mono"
-                      >
-                        <span className="text-zinc-700 dark:text-zinc-300 truncate pr-4">
-                          {source.path}
-                        </span>
-                        <span className="text-zinc-400 dark:text-zinc-500 shrink-0">
-                          {formatBytes(source.size)}
-                        </span>
-                      </div>
-                    ))}
+                  <div className="space-y-3">
+                    {task.sources.map((source) => {
+                      const normalizedPath = source.path.replace(/\//g, '\\');
+                      const normalizedPrefix = (task.common_prefix || '').replace(/\//g, '\\');
+
+                      const relPath =
+                        normalizedPrefix && normalizedPath.startsWith(normalizedPrefix)
+                          ? normalizedPath.substring(normalizedPrefix.length).replace(/^[\\/]/, '')
+                          : normalizedPath.split(/[\\/]/).pop() || '';
+
+                      const targetPath = `${task.target_base}\\${task.name}\\${relPath}`.replace(
+                        /\\\\/g,
+                        '\\',
+                      );
+                      return (
+                        <div key={source.path} className="flex flex-col gap-1">
+                          <div className="flex justify-between items-center text-xs font-mono">
+                            <span className="text-zinc-700 dark:text-zinc-300 truncate pr-4">
+                              {source.path}
+                            </span>
+                            <span className="text-zinc-400 dark:text-zinc-500 shrink-0">
+                              {formatBytes(source.size)}
+                            </span>
+                          </div>
+                          <div className="flex items-center gap-2 text-[10px] font-mono text-zinc-400 dark:text-zinc-500 pl-2 border-l border-zinc-200 dark:border-zinc-700 ml-1">
+                            <span className="shrink-0">└─→</span>
+                            <span className="truncate">{targetPath}</span>
+                          </div>
+                        </div>
+                      );
+                    })}
                   </div>
                 </div>
               </div>

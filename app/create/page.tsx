@@ -340,6 +340,7 @@ function useTaskActions(
   setExpandedNodes: (s: Set<string>) => void,
   taskName: string,
   targetBase: string,
+  commonPrefix: string,
   setIsSaving: (b: boolean) => void,
   router: ReturnType<typeof useRouter>,
   isBlacklisted: (path: string) => boolean,
@@ -419,7 +420,11 @@ function useTaskActions(
         id: crypto.randomUUID(),
         name: taskName,
         target_base: targetBase,
-        sources: Array.from(selectedPaths.entries()).map(([p, s]) => ({ path: p, size: s })),
+        common_prefix: commonPrefix,
+        sources: Array.from(selectedPaths.entries()).map(([p, s]) => ({
+          path: p.replace(/\//g, '\\'),
+          size: s,
+        })),
         status: 'pending',
         created_at: Math.floor(Date.now() / 1000),
       };
@@ -649,8 +654,16 @@ function TaskPreviewSection({
                   生成的目标路径
                 </p>
                 {selectedItems.map((item) => {
-                  const rel = item.path.substring(commonPrefix.length);
-                  const final = `${targetBase}\\${taskName || '[方案名]'}\\${rel}`;
+                  const normalizedPath = item.path.replace(/\//g, '\\');
+                  const normalizedPrefix = commonPrefix.replace(/\//g, '\\');
+                  const rel = normalizedPath.startsWith(normalizedPrefix)
+                    ? normalizedPath.substring(normalizedPrefix.length).replace(/^[\\/]/, '')
+                    : normalizedPath.split(/[\\/]/).pop() || '';
+
+                  const final = `${targetBase}\\${taskName || '[方案名]'}\\${rel}`.replace(
+                    /\\\\/g,
+                    '\\',
+                  );
                   return (
                     <div
                       key={item.path}
@@ -853,6 +866,7 @@ export default function CreateTaskPage() {
     setExpandedNodes,
     taskName,
     targetBase,
+    commonPrefix,
     setIsSaving,
     router,
     isBlacklisted,

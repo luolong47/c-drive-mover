@@ -23,6 +23,7 @@ export interface MoveTask {
   id: string;
   name: string;
   target_base: string;
+  common_prefix: string;
   sources: TaskSource[];
   status: 'pending' | 'running' | 'success' | 'failed';
   error?: string;
