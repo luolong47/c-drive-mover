@@ -109,6 +109,21 @@ function buildTreeFromPaths(
   return { roots, parentPaths };
 }
 
+function tryCompactWithChild(node: FileNode): FileNode {
+  if (node.children && node.children.length === 1) {
+    const child = node.children[0];
+    if (!node.is_match && !child.is_match) {
+      const sep = node.name.endsWith('\\') ? '' : '\\';
+      return {
+        ...child,
+        name: `${node.name}${sep}${child.name}`,
+        segments: [...(node.segments || []), ...(child.segments || [])],
+      };
+    }
+  }
+  return node;
+}
+
 // 合并单子节点目录以实现紧凑展示，同时保留路径段以便独立勾选
 function compactNodes(nodes: FileNode[]): FileNode[] {
   return nodes.map((node) => {
@@ -124,20 +139,7 @@ function compactNodes(nodes: FileNode[]): FileNode[] {
       current.children = compactNodes(current.children);
     }
 
-    // 如果只有一个子节点，且当前节点和子节点都不是搜索直接匹配项，则尝试合并
-    if (current.children && current.children.length === 1) {
-      const child = current.children[0];
-      if (!current.is_match && !child.is_match) {
-        const sep = current.name.endsWith('\\') ? '' : '\\';
-        return {
-          ...child,
-          name: `${current.name}${sep}${child.name}`,
-          segments: [...(current.segments || []), ...(child.segments || [])],
-        };
-      }
-    }
-
-    return current;
+    return tryCompactWithChild(current);
   });
 }
 

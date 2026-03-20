@@ -4,9 +4,8 @@
   "private": true,
   "scripts": {
     "lint": "biome check --write .",
-    "prebuild": "pnpm lint",
-    "build": "tauri build && node -e \"const fs=require('fs'); if(!fs.existsSync('dist/release'))fs.mkdirSync('dist/release', {recursive:true}); fs.copyFileSync('src-tauri/target/release/c-drive-mover.exe', 'dist/release/c-drive-mover.exe')\"",
-    "postbuild": "echo [Done] Final product is in dist/release/"
+    "prebuild": "(sudo taskkill /F /IM c-drive-mover.exe /T 2>nul || type nul) & pnpm lint",
+    "build": "tauri build && node -e \"const fs=require('fs'); if(!fs.existsSync('dist/release'))fs.mkdirSync('dist/release', {recursive:true}); fs.copyFileSync('src-tauri/target/release/c-drive-mover.exe', 'dist/release/c-drive-mover.exe')\""
   },
   "dependencies": {
     "@google/genai": "^1.17.0",

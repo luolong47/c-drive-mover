@@ -31,6 +31,14 @@ export interface MoveTask {
   finished_at?: number;
 }
 
+export interface LogEntry {
+  id: number;
+  task_id: string;
+  msg: string;
+  event_type: 'info' | 'warn' | 'error' | 'success';
+  created_at: number;
+}
+
 export interface AppSettings {
   default_target_base: string;
   silent_check: boolean;
@@ -51,6 +59,14 @@ export async function getFolderSize(path: string): Promise<number> {
 
 export async function getTasks(): Promise<MoveTask[]> {
   return await invoke('get_tasks');
+}
+
+export async function deleteTask(task_id: string): Promise<void> {
+  await invoke('delete_task', { taskId: task_id });
+}
+
+export async function getTaskLogs(task_id: string): Promise<LogEntry[]> {
+  return await invoke('get_task_logs', { taskId: task_id });
 }
 
 export async function saveTask(task: MoveTask): Promise<void> {

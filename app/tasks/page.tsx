@@ -2,17 +2,19 @@
 
 import {
   AlertCircle,
+  FileText,
   FolderOpen,
   Loader2,
   Play,
   PlusCircle,
   RotateCcw,
   Search,
+  Trash2,
 } from 'lucide-react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { useCallback, useEffect, useState } from 'react';
-import { getTasks, type MoveTask, restoreTask } from '@/lib/tauri-api';
+import { deleteTask, getTasks, type MoveTask } from '@/lib/tauri-api';
 import { formatBytes } from '@/lib/utils';
 
 const statusConfig: Record<string, { label: string; color: string; bg: string }> = {
@@ -64,18 +66,22 @@ export default function TasksPage() {
     router.push(`/monitor?taskId=${task_id}`);
   };
 
-  const handleRestoreTask = async (task_id: string) => {
-    if (!confirm('确定要从目标盘恢复数据到 C 盘吗？这将删除现有的目录联接并移回原始数据。')) return;
+  const handleRestoreTask = (task_id: string) => {
+    router.push(`/monitor?taskId=${task_id}&action=restore`);
+  };
+
+  const handleViewLogs = (task_id: string) => {
+    router.push(`/monitor?taskId=${task_id}&action=view`);
+  };
+
+  const handleDeleteTask = async (task_id: string) => {
+    if (!confirm('确定要删除这个迁移方案吗？这不会影响已经迁移的数据或目录联接。')) return;
     try {
-      setTasks((prev) =>
-        prev.map((t) => (t.id === task_id ? { ...t, status: 'running', error: undefined } : t)),
-      );
-      await restoreTask(task_id);
+      await deleteTask(task_id);
       await fetchTasks();
     } catch (err) {
-      console.error('Restore failed:', err);
-      alert(`还原失败: ${err}`);
-      await fetchTasks();
+      console.error('Delete failed:', err);
+      alert(`删除失败: ${err}`);
     }
   };
 
@@ -176,6 +182,16 @@ export default function TasksPage() {
                     )}
                   </div>
                   <div className="flex gap-2">
+                    {task.status === 'pending' && (
+                      <button
+                        type="button"
+                        onClick={() => handleDeleteTask(task.id)}
+                        className="p-2 text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-500/10 rounded-md transition-colors"
+                        title="删除方案"
+                      >
+                        <Trash2 size={18} />
+                      </button>
+                    )}
                     {(task.status === 'pending' || task.status === 'failed') && (
                       <button
                         type="button"
@@ -191,7 +207,7 @@ export default function TasksPage() {
                         <Loader2 size={18} className="animate-spin" />
                       </div>
                     )}
-                    {task.status === 'success' && (
+                    {(task.status === 'success' || task.status === 'failed') && (
                       <button
                         type="button"
                         onClick={() => handleRestoreTask(task.id)}
@@ -199,6 +215,16 @@ export default function TasksPage() {
                         title="还原至C盘"
                       >
                         <RotateCcw size={18} />
+                      </button>
+                    )}
+                    {(task.status === 'success' || task.status === 'failed') && (
+                      <button
+                        type="button"
+                        onClick={() => handleViewLogs(task.id)}
+                        className="p-2 text-zinc-600 dark:text-zinc-400 hover:bg-zinc-50 dark:hover:bg-zinc-500/10 rounded-md transition-colors"
+                        title="查看记录"
+                      >
+                        <FileText size={18} />
                       </button>
                     )}
                   </div>

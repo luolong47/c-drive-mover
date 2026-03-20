@@ -188,6 +188,14 @@ async fn get_folder_size(path: String) -> u64 {
 }
 
 #[tauri::command]
+fn delete_task(db: State<DbState>, task_id: String) -> Result<(), String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    conn.execute("DELETE FROM tasks WHERE id = ?", [&task_id])
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
 fn get_tasks(db: State<DbState>) -> Result<Vec<MoveTask>, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
     let mut stmt = conn
@@ -236,8 +244,47 @@ fn get_tasks(db: State<DbState>) -> Result<Vec<MoveTask>, String> {
     Ok(tasks)
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct LogEntry {
+    pub id: i64,
+    pub task_id: String,
+    pub msg: String,
+    pub event_type: String,
+    pub created_at: i64,
+}
+
+#[tauri::command]
+fn get_task_logs(db: State<DbState>, task_id: String) -> Result<Vec<LogEntry>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare("SELECT id, task_id, msg, event_type, created_at FROM task_logs WHERE task_id = ? ORDER BY created_at ASC")
+        .map_err(|e| e.to_string())?;
+
+    let log_iter = stmt
+        .query_map([&task_id], |row| {
+            Ok(LogEntry {
+                id: row.get(0)?,
+                task_id: row.get(1)?,
+                msg: row.get(2)?,
+                event_type: row.get(3)?,
+                created_at: row.get(4)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+
+    let mut logs = Vec::new();
+    for log in log_iter {
+        logs.push(log.map_err(|e| e.to_string())?);
+    }
+    Ok(logs)
+}
+
 #[tauri::command]
 fn save_task(db: State<DbState>, task: MoveTask) -> Result<(), String> {
+    _save_task(&db, task)
+}
+
+fn _save_task(db: &DbState, task: MoveTask) -> Result<(), String> {
     let mut conn = db.0.lock().map_err(|e| e.to_string())?;
     let tx = conn.transaction().map_err(|e| e.to_string())?;
 
@@ -285,14 +332,24 @@ pub struct MigrationEvent {
     pub event_type: String, // "info", "warn", "error", "success"
 }
 
-fn emit_log(app_handle: &AppHandle, msg: String, event_type: &str) {
+fn emit_log(app_handle: &AppHandle, db: Option<&DbState>, task_id: &str, msg: String, event_type: &str) {
+    let now = now_timestamp();
     let _ = app_handle.emit(
         "migration-log",
         MigrationEvent {
-            msg,
+            msg: msg.clone(),
             event_type: event_type.to_string(),
         },
     );
+
+    if let Some(db_state) = db {
+        if let Ok(conn) = db_state.0.lock() {
+            let _ = conn.execute(
+                "INSERT INTO task_logs (task_id, msg, event_type, created_at) VALUES (?, ?, ?, ?)",
+                params![task_id, msg, event_type, now],
+            );
+        }
+    }
 }
 
 #[tauri::command]
@@ -301,7 +358,14 @@ async fn run_migration(
     db: State<'_, DbState>,
     task_id: String,
 ) -> Result<(), String> {
-    emit_log(&app_handle, format!("开始执行任务: {}", task_id), "info");
+    // 清除旧日志
+    {
+        if let Ok(conn) = db.0.lock() {
+            let _ = conn.execute("DELETE FROM task_logs WHERE task_id = ?", [&task_id]);
+        }
+    }
+
+    emit_log(&app_handle, Some(&db), &task_id, format!("开始执行任务: {}", task_id), "info");
     log::info!("Starting migration for task ID: {}", task_id);
     let task = {
         let conn = db.0.lock().map_err(|e| {
@@ -351,6 +415,8 @@ async fn run_migration(
 
     emit_log(
         &app_handle,
+        Some(&db),
+        &task_id,
         format!("任务准备就绪: {}, 源目录数: {}", task.name, task.sources.len()),
         "info",
     );
@@ -360,7 +426,7 @@ async fn run_migration(
         let mut running_task = task.clone();
         running_task.status = "running".to_string();
         running_task.error = None;
-        save_task(db.clone(), running_task).map_err(|e| {
+        _save_task(&db, running_task).map_err(|e| {
             log::error!("Failed to save 'running' status: {}", e);
             e
         })?;
@@ -388,6 +454,8 @@ async fn run_migration(
 
         emit_log(
             &app_handle,
+            Some(&db),
+            &task_id,
             format!("正在处理: {}", source.path),
             "info",
         );
@@ -396,7 +464,7 @@ async fn run_migration(
         if !source_path.exists() {
             has_error = true;
             error_msg = format!("源目录不存在: {}", source.path);
-            emit_log(&app_handle, error_msg.clone(), "error");
+            emit_log(&app_handle, Some(&db), &task_id, error_msg.clone(), "error");
             log::error!("{}", error_msg);
             break;
         }
@@ -407,7 +475,7 @@ async fn run_migration(
                 if let Err(e) = fs::create_dir_all(parent) {
                     has_error = true;
                     error_msg = format!("无法创建目标父目录 {:?}: {}", parent, e);
-                    emit_log(&app_handle, error_msg.clone(), "error");
+                    emit_log(&app_handle, Some(&db), &task_id, error_msg.clone(), "error");
                     log::error!("{}", error_msg);
                     break;
                 }
@@ -417,12 +485,12 @@ async fn run_migration(
         if target_path.exists() {
             has_error = true;
             error_msg = format!("目标目录已存在，迁移中止以防止数据覆盖: {:?}", target_path);
-            emit_log(&app_handle, error_msg.clone(), "error");
+            emit_log(&app_handle, Some(&db), &task_id, error_msg.clone(), "error");
             log::error!("{}", error_msg);
             break;
         }
 
-        emit_log(&app_handle, "正在移动目录文件...".to_string(), "info");
+        emit_log(&app_handle, Some(&db), &task_id, "正在移动目录文件...".to_string(), "info");
         log::info!("Moving directory...");
         let options = fs_extra::dir::CopyOptions::new().content_only(false);
         
@@ -432,24 +500,24 @@ async fn run_migration(
         if let Err(e) = fs_extra::dir::move_dir(source_path, target_parent, &options) {
             has_error = true;
             error_msg = format!("无法移动目录 {}: {}. 请确保没有程序正在使用该目录。", source.path, e);
-            emit_log(&app_handle, error_msg.clone(), "error");
+            emit_log(&app_handle, Some(&db), &task_id, error_msg.clone(), "error");
             log::error!("{}", error_msg);
             break;
         }
 
         #[cfg(windows)]
         {
-            emit_log(&app_handle, "创建 Windows 目录联接 (Junction)...".to_string(), "info");
+            emit_log(&app_handle, Some(&db), &task_id, "创建 Windows 目录联接 (Junction)...".to_string(), "info");
             log::info!("Creating junction point at {:?}", source_path);
             if let Err(e) = junction::create(&target_path, source_path) {
                 has_error = true;
                 error_msg = format!("无法为 {} 创建目录联接: {}. 迁移已完成但联接失败。", source.path, e);
-                emit_log(&app_handle, error_msg.clone(), "error");
+                emit_log(&app_handle, Some(&db), &task_id, error_msg.clone(), "error");
                 log::error!("{}", error_msg);
                 break;
             }
         }
-        emit_log(&app_handle, format!("已成功迁移: {}", source.path), "success");
+        emit_log(&app_handle, Some(&db), &task_id, format!("已成功迁移: {}", source.path), "success");
     }
 
     let mut final_task = task.clone();
@@ -457,18 +525,18 @@ async fn run_migration(
         log::warn!("Migration finished with error: {}", error_msg);
         final_task.status = "failed".to_string();
         final_task.error = Some(error_msg.clone());
-        emit_log(&app_handle, "迁移任务失败".to_string(), "error");
+        emit_log(&app_handle, Some(&db), &task_id, "迁移任务失败".to_string(), "error");
     } else {
         log::info!("Migration completed successfully!");
         final_task.status = "success".to_string();
         final_task.finished_at = Some(now_timestamp());
         final_task.error = None;
-        emit_log(&app_handle, "所有目录迁移成功完成！".to_string(), "success");
+        emit_log(&app_handle, Some(&db), &task_id, "所有目录迁移成功完成！".to_string(), "success");
     }
 
-    if let Err(e) = save_task(db, final_task) {
+    if let Err(e) = _save_task(&db, final_task) {
         log::error!("Failed to save final task status: {}", e);
-        emit_log(&app_handle, "任务已执行但保存状态失败".to_string(), "warn");
+        emit_log(&app_handle, Some(&db), &task_id, "任务已执行但保存状态失败".to_string(), "warn");
         return Err(format!("任务已执行但保存状态失败: {}", e));
     }
 
@@ -485,7 +553,14 @@ async fn restore_task(
     db: State<'_, DbState>,
     task_id: String,
 ) -> Result<(), String> {
-    emit_log(&app_handle, format!("开始还原任务: {}", task_id), "info");
+    // 清除旧日志
+    {
+        if let Ok(conn) = db.0.lock() {
+            let _ = conn.execute("DELETE FROM task_logs WHERE task_id = ?", [&task_id]);
+        }
+    }
+
+    emit_log(&app_handle, Some(&db), &task_id, format!("开始还原任务: {}", task_id), "info");
     log::info!("Starting restore for task ID: {}", task_id);
     let task = {
         let conn = db.0.lock().map_err(|e| {
@@ -537,7 +612,7 @@ async fn restore_task(
     {
         let mut running_task = task.clone();
         running_task.status = "running".to_string();
-        save_task(db.clone(), running_task).map_err(|e| {
+        _save_task(&db, running_task).map_err(|e| {
             log::error!("Failed to save status: {}", e);
             e
         })?;
@@ -561,7 +636,7 @@ async fn restore_task(
         let rel_path = rel_path.trim_start_matches('\\').trim_start_matches('/');
         let target_path = target_root.join(rel_path);
 
-        emit_log(&app_handle, format!("正在还原: {}", source.path), "info");
+        emit_log(&app_handle, Some(&db), &task_id, format!("正在还原: {}", source.path), "info");
         log::info!("Restoring source: {:?} <- {:?}", source_path, target_path);
 
         #[cfg(windows)]
@@ -573,14 +648,14 @@ async fn restore_task(
                     if let Err(e) = std::fs::remove_dir(source_path) {
                         has_error = true;
                         error_msg = format!("无法删除目录联接 {}: {}. 请检查权限或是否被占用。", source.path, e);
-                        emit_log(&app_handle, error_msg.clone(), "error");
+                        emit_log(&app_handle, Some(&db), &task_id, error_msg.clone(), "error");
                         log::error!("{}", error_msg);
                         break;
                     }
                 } else {
                     has_error = true;
                     error_msg = format!("路径 {} 已存在且不是联接点，还原中止以防止数据覆盖。", source.path);
-                    emit_log(&app_handle, error_msg.clone(), "error");
+                    emit_log(&app_handle, Some(&db), &task_id, error_msg.clone(), "error");
                     log::error!("{}", error_msg);
                     break;
                 }
@@ -588,21 +663,21 @@ async fn restore_task(
         }
 
         if target_path.exists() {
-            emit_log(&app_handle, "正在将数据移回 C 盘...".to_string(), "info");
+            emit_log(&app_handle, Some(&db), &task_id, "正在将数据移回 C 盘...".to_string(), "info");
             log::info!("Moving directory back to C drive...");
             let options = fs_extra::dir::CopyOptions::new().content_only(false);
             let parent = source_path.parent().ok_or("无法获取源路径父目录")?;
             if let Err(e) = fs_extra::dir::move_dir(&target_path, parent, &options) {
                 has_error = true;
                 error_msg = format!("无法将数据移回 {}: {}. 请确保目标位置可写。", source.path, e);
-                emit_log(&app_handle, error_msg.clone(), "error");
+                emit_log(&app_handle, Some(&db), &task_id, error_msg.clone(), "error");
                 log::error!("{}", error_msg);
                 break;
             }
         } else {
             log::warn!("Target directory {:?} does not exist, skipping move.", target_path);
         }
-        emit_log(&app_handle, format!("已成功还原: {}", source.path), "success");
+        emit_log(&app_handle, Some(&db), &task_id, format!("已成功还原: {}", source.path), "success");
     }
 
     let mut final_task = task.clone();
@@ -610,22 +685,22 @@ async fn restore_task(
         log::error!("Restore failed: {}", error_msg);
         final_task.status = "failed".to_string();
         final_task.error = Some(format!("还原失败: {}", error_msg));
-        emit_log(&app_handle, "还原任务失败".to_string(), "error");
+        emit_log(&app_handle, Some(&db), &task_id, "还原任务失败".to_string(), "error");
     } else {
         log::info!("Restore completed successfully!");
         final_task.status = "pending".to_string();
         final_task.error = None;
         final_task.finished_at = None;
-        emit_log(&app_handle, "所有目录还原成功完成！".to_string(), "success");
+        emit_log(&app_handle, Some(&db), &task_id, "所有目录还原成功完成！".to_string(), "success");
 
         if target_root.exists() {
             let _ = std::fs::remove_dir(&target_root);
         }
     }
 
-    if let Err(e) = save_task(db, final_task) {
+    if let Err(e) = _save_task(&db, final_task) {
         log::error!("Failed to save final status: {}", e);
-        emit_log(&app_handle, "还原操作已执行但状态保存失败".to_string(), "warn");
+        emit_log(&app_handle, Some(&db), &task_id, "还原操作已执行但状态保存失败".to_string(), "warn");
         return Err(format!("还原操作已执行但状态保存失败: {}", e));
     }
 
@@ -840,6 +915,19 @@ fn init_db(app_handle: &AppHandle) -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
 
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS task_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL,
+            msg TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
+        )",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+
     // --- Data Migration Logic ---
     let app_data_dir = app_handle.path().app_data_dir().unwrap_or_default();
     let exe_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(|p| p.to_path_buf())).unwrap_or_default();
@@ -915,7 +1003,9 @@ pub fn run() {
             get_disk_info,
             scan_directory,
             get_folder_size,
+            delete_task,
             get_tasks,
+            get_task_logs,
             save_task,
             run_migration,
             restore_task,
