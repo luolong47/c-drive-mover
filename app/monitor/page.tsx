@@ -1,47 +1,18 @@
 'use client';
 
-import { CheckCircle2, HardDrive, Play, RotateCcw, Terminal } from 'lucide-react';
+import { listen } from '@tauri-apps/api/event';
+import { AlertCircle, CheckCircle2, HardDrive, Loader2, Play, Terminal } from 'lucide-react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { Suspense, useCallback, useEffect, useRef, useState } from 'react';
+import { getTasks, type MoveTask, runMigration } from '@/lib/tauri-api';
 import { formatBytes } from '@/lib/utils';
 
-// Mock execution stages
+// 实际执行阶段映射
 const STAGES = [
-  { id: 'precheck', name: '迁移前检查 (Pre-check)' },
-  { id: 'copy', name: '原子化复制 (Atomicity Copy)' },
-  { id: 'rename', name: '重命名备份 (Rename Backup)' },
-  { id: 'link', name: '创建软链接 (Create Junction)' },
-  { id: 'cleanup', name: '清理备份 (Cleanup)' },
-];
-
-// Mock data
-const mockTasks = [
-  {
-    id: '1769590899250',
-    name: 'antigravity',
-    targetBase: 'D:\\Cdata',
-    totalSize: 1024 * 1024 * 1024 * 15.4,
-    sources: [{ originalPath: 'C:\\Users\\LuoLong\\.antigravity', size: 1024 * 1024 * 500 }],
-  },
-  {
-    id: '1769590899251',
-    name: 'docker-data',
-    targetBase: 'E:\\DockerData',
-    totalSize: 1024 * 1024 * 1024 * 45.2,
-    sources: [{ originalPath: 'C:\\ProgramData\\Docker', size: 1024 * 1024 * 1024 * 45.2 }],
-  },
-  {
-    id: '1769590899252',
-    name: 'npm-cache',
-    targetBase: 'D:\\DevCache',
-    totalSize: 1024 * 1024 * 1024 * 2.1,
-    sources: [
-      {
-        originalPath: 'C:\\Users\\LuoLong\\AppData\\Local\\npm-cache',
-        size: 1024 * 1024 * 1024 * 2.1,
-      },
-    ],
-  },
+  { id: 'precheck', name: '环境检查 (Pre-check)' },
+  { id: 'move', name: '数据迁移 (Data Migration)' },
+  { id: 'junction', name: '目录联接 (Junction)' },
+  { id: 'cleanup', name: '状态同步 (Sync)' },
 ];
 
 interface LogEntry {
@@ -54,16 +25,16 @@ interface LogEntry {
 function LogTerminal({ logs }: { logs: LogEntry[] }) {
   const logsEndRef = useRef<HTMLDivElement>(null);
 
-  // biome-ignore lint/correctness/useExhaustiveDependencies: 必须监听 logs 变化以滚动日志
+  // biome-ignore lint/correctness/useExhaustiveDependencies: 需要在日志更新时滚动
   useEffect(() => {
     logsEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [logs]);
 
   return (
-    <div className="lg:col-span-2 bg-[#151619] rounded-xl border border-zinc-800 flex flex-col shadow-xl overflow-hidden min-h-0">
+    <div className="lg:col-span-2 bg-[#151619] rounded-xl border border-zinc-800 flex flex-col shadow-xl overflow-hidden min-h-0 h-[400px] lg:h-auto">
       <div className="bg-[#1e1e24] px-4 py-3 border-b border-zinc-800 flex items-center gap-2 shrink-0">
         <Terminal size={16} className="text-zinc-400" />
-        <span className="text-xs font-mono text-zinc-300">极客日志控制台 (Log Terminal)</span>
+        <span className="text-xs font-mono text-zinc-300">系统日志控制台 (System Logs)</span>
         <div className="ml-auto flex gap-1.5">
           <div className="w-2.5 h-2.5 rounded-full bg-red-500/80" />
           <div className="w-2.5 h-2.5 rounded-full bg-amber-500/80" />
@@ -73,7 +44,7 @@ function LogTerminal({ logs }: { logs: LogEntry[] }) {
 
       <div className="p-4 overflow-y-auto flex-1 font-mono text-xs leading-relaxed custom-scrollbar text-zinc-300">
         {logs.length === 0 ? (
-          <div className="text-zinc-600 italic">等待执行...</div>
+          <div className="text-zinc-600 italic">等待任务启动...</div>
         ) : (
           <div className="space-y-1">
             {logs.map((log) => (
@@ -104,24 +75,20 @@ function MonitorContent() {
   const searchParams = useSearchParams();
   const taskId = searchParams.get('taskId');
 
-  const task = mockTasks.find((t) => t.id === taskId) || mockTasks[0];
-
-  const [status, setStatus] = useState<
-    'idle' | 'running' | 'paused' | 'completed' | 'error' | 'rolling_back'
-  >('idle');
+  const [task, setTask] = useState<MoveTask | null>(null);
+  const [status, setStatus] = useState<'idle' | 'running' | 'completed' | 'error'>('idle');
   const [currentStage, setCurrentStage] = useState(0);
   const [progress, setProgress] = useState(0);
-  const [subProgress, setSubProgress] = useState(0);
   const [logs, setLogs] = useState<LogEntry[]>([]);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   const addLog = useCallback(
     (msg: string, type: 'info' | 'warn' | 'error' | 'success' = 'info') => {
-      const time = new Date().toLocaleTimeString('en-US', {
+      const time = new Date().toLocaleTimeString('zh-CN', {
         hour12: false,
         hour: '2-digit',
         minute: '2-digit',
         second: '2-digit',
-        fractionalSecondDigits: 3,
       });
       const id = Math.random().toString(36).substring(2, 11);
       setLogs((prev) => [...prev, { id, time, msg, type }]);
@@ -129,177 +96,100 @@ function MonitorContent() {
     [],
   );
 
-  const delay = useCallback((ms: number) => new Promise((r) => setTimeout(r, ms)), []);
-
-  const runPrecheck = useCallback(
-    async (isCancelled: boolean) => {
-      addLog('开始执行迁移前检查...', 'info');
-      await delay(800);
-      if (isCancelled) return false;
-      addLog(`检查目标盘空间: 充足 (剩余 100GB > 需求 ${formatBytes(task.totalSize)})`, 'success');
-      await delay(500);
-      if (isCancelled) return false;
-      addLog('检查目标文件系统: NTFS (支持 Junction)', 'success');
-      await delay(500);
-      if (isCancelled) return false;
-      addLog('进程占用检测: 未发现文件锁定 (File Lock)', 'success');
-      return true;
-    },
-    [addLog, delay, task.totalSize],
-  );
-
-  const runCopySimulation = useCallback(
-    (resolve: (val: boolean) => void, isCancelled: { current: boolean }) => {
-      let p = 0;
-      const interval = setInterval(() => {
-        if (isCancelled.current) {
-          clearInterval(interval);
-          resolve(false);
-          return;
-        }
-        p += Math.random() * 15;
-        if (p >= 100) {
-          clearInterval(interval);
-          setSubProgress(100);
-          setProgress(60);
-          addLog(`复制完成: ${formatBytes(task.totalSize)}, 耗时 4.2s`, 'success');
-          setTimeout(() => {
-            if (!isCancelled.current) resolve(true);
-          }, 1000);
-        } else {
-          setSubProgress(p);
-          setProgress(10 + p * 0.5);
-          if (Math.random() > 0.8) {
-            addLog(`[robocopy] 正在复制: data_${Math.floor(Math.random() * 1000)}.bin`, 'info');
-          }
-        }
-      }, 300);
-    },
-    [addLog, task.totalSize],
-  );
-
-  const runRename = useCallback(
-    async (isCancelled: boolean) => {
-      addLog('开始重命名源目录为备份...', 'info');
-      await delay(1000);
-      if (isCancelled) return false;
-      const sourcePath = task.sources[0]?.originalPath || 'C:\\Source';
-      addLog(`重命名: ${sourcePath} -> ${sourcePath}_backup`, 'success');
-      setProgress(70);
-      return true;
-    },
-    [addLog, delay, task.sources],
-  );
-
-  const runLink = useCallback(
-    async (isCancelled: boolean) => {
-      addLog('开始创建跨平台软链接...', 'info');
-      await delay(1000);
-      if (isCancelled) return false;
-      const sourcePath = task.sources[0]?.originalPath || 'C:\\Source';
-      const targetPath = `${task.targetBase}\\${task.name}`;
-      addLog(`执行: fs.symlinkSync("${targetPath}", "${sourcePath}", "junction")`, 'info');
-      await delay(800);
-      if (isCancelled) return false;
-      addLog('Junction 创建成功', 'success');
-      setProgress(85);
-      return true;
-    },
-    [addLog, delay, task.name, task.targetBase, task.sources],
-  );
-
+  // 加载任务数据
   useEffect(() => {
-    if (status !== 'running') return;
-
-    let isCancelledValue = false;
-    const isCancelledRef = { current: false };
-
-    const executePrecheck = async (isCancelledValue: boolean) => {
-      if (await runPrecheck(isCancelledValue)) {
-        setCurrentStage(1);
-        setProgress(10);
+    if (!taskId) return;
+    const fetchTask = async () => {
+      try {
+        const tasks = await getTasks();
+        const found = tasks.find((t) => t.id === taskId);
+        if (found) {
+          setTask(found);
+          if (found.status === 'success') setStatus('completed');
+          if (found.status === 'failed') setStatus('error');
+        } else {
+          setErrorMsg('未找到指定的任务 ID');
+        }
+      } catch (err) {
+        console.error('Failed to fetch task:', err);
+        setErrorMsg('获取任务信息失败');
       }
     };
+    fetchTask();
+  }, [taskId]);
 
-    const executeCopy = async (isCancelledRef: { current: boolean }) => {
-      if (await new Promise<boolean>((resolve) => runCopySimulation(resolve, isCancelledRef))) {
-        setCurrentStage(2);
-        setSubProgress(0);
-      }
-    };
+  // 监听后端日志事件
+  useEffect(() => {
+    const unlisten = listen<{ msg: string; event_type: string }>('migration-log', (event) => {
+      const { msg, event_type } = event.payload;
+      addLog(msg, event_type as 'info' | 'warn' | 'error' | 'success');
 
-    const executeRename = async (isCancelledValue: boolean) => {
-      if (await runRename(isCancelledValue)) {
+      // 根据消息关键词模糊匹配进度阶段
+      if (msg.includes('准备就绪')) setCurrentStage(0);
+      if (msg.includes('正在移动')) setCurrentStage(1);
+      if (msg.includes('创建 Windows 目录联接')) setCurrentStage(2);
+      if (msg.includes('迁移成功完成')) {
         setCurrentStage(3);
-      }
-    };
-
-    const executeLink = async (isCancelledValue: boolean) => {
-      if (await runLink(isCancelledValue)) {
-        setCurrentStage(4);
-      }
-    };
-
-    const executeCleanup = async (isCancelledValue: boolean) => {
-      addLog('开始异步清理备份文件...', 'info');
-      await delay(1500);
-      if (!isCancelledValue) {
-        addLog('清理完成，任务成功', 'success');
         setProgress(100);
-        setStatus('completed');
       }
-    };
 
-    const runStage = async () => {
-      switch (currentStage) {
-        case 0:
-          await executePrecheck(isCancelledValue);
-          break;
-        case 1:
-          await executeCopy(isCancelledRef);
-          break;
-        case 2:
-          await executeRename(isCancelledValue);
-          break;
-        case 3:
-          await executeLink(isCancelledValue);
-          break;
-        case 4:
-          await executeCleanup(isCancelledValue);
-          break;
-      }
-    };
-
-    runStage();
+      // 平滑增加进度
+      setProgress((prev) => Math.min(prev + 100 / ((task?.sources.length || 1) * 4), 95));
+    });
 
     return () => {
-      isCancelledValue = true;
-      isCancelledRef.current = true;
+      unlisten.then((f) => f());
     };
-  }, [status, currentStage, addLog, delay, runPrecheck, runCopySimulation, runRename, runLink]);
+  }, [addLog, task]);
 
-  const handleStart = () => {
-    if (status === 'idle') {
-      setStatus('running');
-      setLogs([]);
-      setCurrentStage(0);
-      setProgress(0);
-      setSubProgress(0);
-      addLog(`初始化迁移任务: ${task.name}`, 'info');
+  const handleStart = async () => {
+    if (!taskId || !task) return;
+
+    setStatus('running');
+    setLogs([]);
+    setCurrentStage(0);
+    setProgress(5);
+    setErrorMsg(null);
+    addLog(`初始化迁移任务: ${task.name}`, 'info');
+
+    try {
+      await runMigration(taskId);
+      setStatus('completed');
+      setProgress(100);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error('Migration failed:', err);
+      setStatus('error');
+      setErrorMsg(msg);
+      addLog(`任务中止: ${msg}`, 'error');
     }
   };
 
-  const handleRollback = () => {
-    setStatus('rolling_back');
-    addLog('触发安全回滚通道...', 'warn');
-    setTimeout(() => {
-      addLog('回滚完成，系统已恢复原状。', 'success');
-      setStatus('idle');
-      setProgress(0);
-      setSubProgress(0);
-      setCurrentStage(0);
-    }, 1500);
-  };
+  if (errorMsg && status !== 'error') {
+    return (
+      <div className="p-8 text-center">
+        <AlertCircle size={48} className="mx-auto text-red-500 mb-4" />
+        <p className="text-zinc-600 dark:text-zinc-400">{errorMsg}</p>
+        <button
+          type="button"
+          onClick={() => router.push('/tasks')}
+          className="mt-4 text-indigo-500 underline"
+        >
+          返回列表
+        </button>
+      </div>
+    );
+  }
+
+  if (!task) {
+    return (
+      <div className="h-full flex items-center justify-center">
+        <Loader2 className="animate-spin text-indigo-500" size={32} />
+      </div>
+    );
+  }
+
+  const totalSize = task.sources.reduce((acc, s) => acc + s.size, 0);
 
   return (
     <div className="p-8 max-w-6xl mx-auto h-full flex flex-col">
@@ -311,15 +201,6 @@ function MonitorContent() {
           <p className="text-zinc-500 dark:text-zinc-400 mt-1">实时监控迁移进度与底层日志</p>
         </div>
         <div className="flex gap-3">
-          {status === 'running' && (
-            <button
-              type="button"
-              onClick={handleRollback}
-              className="px-4 py-2 text-sm font-medium text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-500/10 hover:bg-red-100 dark:hover:bg-red-500/20 rounded-lg transition-colors flex items-center gap-2 border border-red-200 dark:border-red-500/20"
-            >
-              <RotateCcw size={16} /> 中止并回滚
-            </button>
-          )}
           {status === 'idle' && (
             <button
               type="button"
@@ -329,13 +210,13 @@ function MonitorContent() {
               <Play size={16} /> 开始执行
             </button>
           )}
-          {status === 'completed' && (
+          {(status === 'completed' || status === 'error') && (
             <button
               type="button"
               onClick={() => router.push('/tasks')}
-              className="px-6 py-2 text-sm font-medium text-white bg-emerald-600 dark:bg-emerald-500 hover:bg-emerald-700 dark:hover:bg-emerald-600 rounded-lg transition-colors flex items-center gap-2 shadow-sm"
+              className="px-6 py-2 text-sm font-medium text-white bg-zinc-800 hover:bg-zinc-700 rounded-lg transition-colors flex items-center gap-2 shadow-sm"
             >
-              <CheckCircle2 size={16} /> 返回方案列表
+              返回方案列表
             </button>
           )}
         </div>
@@ -354,14 +235,17 @@ function MonitorContent() {
               </div>
               <div className="flex justify-between">
                 <span className="text-zinc-500 dark:text-zinc-400">目标路径</span>
-                <span className="font-mono text-zinc-700 dark:text-zinc-300">
-                  {task.targetBase}
+                <span
+                  className="font-mono text-zinc-700 dark:text-zinc-300 truncate max-w-[150px]"
+                  title={task.target_base}
+                >
+                  {task.target_base}
                 </span>
               </div>
               <div className="flex justify-between">
                 <span className="text-zinc-500 dark:text-zinc-400">总计大小</span>
                 <span className="font-mono text-zinc-700 dark:text-zinc-300">
-                  {formatBytes(task.totalSize)}
+                  {formatBytes(totalSize)}
                 </span>
               </div>
               <div className="flex justify-between items-center pt-3 border-t border-zinc-100 dark:border-zinc-800">
@@ -371,13 +255,13 @@ function MonitorContent() {
                   ${status === 'idle' ? 'bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-400 border-zinc-200 dark:border-zinc-700' : ''}
                   ${status === 'running' ? 'bg-blue-50 dark:bg-blue-500/10 text-blue-600 dark:text-blue-400 border-blue-200 dark:border-blue-500/20 animate-pulse' : ''}
                   ${status === 'completed' ? 'bg-emerald-50 dark:bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border-emerald-200 dark:border-emerald-500/20' : ''}
-                  ${status === 'rolling_back' ? 'bg-amber-50 dark:bg-amber-500/10 text-amber-600 dark:text-amber-400 border-amber-200 dark:border-amber-500/20' : ''}
+                  ${status === 'error' ? 'bg-red-50 dark:bg-red-500/10 text-red-600 dark:text-red-400 border-red-200 dark:border-red-500/20' : ''}
                 `}
                 >
                   {status === 'idle' && '等待执行'}
                   {status === 'running' && '迁移中...'}
                   {status === 'completed' && '执行成功'}
-                  {status === 'rolling_back' && '回滚中...'}
+                  {status === 'error' && '执行失败'}
                 </span>
               </div>
             </div>
@@ -397,22 +281,6 @@ function MonitorContent() {
                   <div
                     className="h-full bg-indigo-500 dark:bg-indigo-400 transition-all duration-300 ease-out"
                     style={{ width: `${progress}%` }}
-                  />
-                </div>
-              </div>
-              <div>
-                <div className="flex justify-between text-xs mb-1.5">
-                  <span className="text-zinc-500 dark:text-zinc-400">
-                    当前阶段: {STAGES[currentStage]?.name || '完成'}
-                  </span>
-                  <span className="font-mono text-zinc-500 dark:text-zinc-400">
-                    {Math.floor(subProgress)}%
-                  </span>
-                </div>
-                <div className="h-1.5 bg-zinc-100 dark:bg-zinc-800 rounded-full overflow-hidden transition-colors">
-                  <div
-                    className="h-full bg-blue-400 dark:bg-blue-500 transition-all duration-200 ease-out"
-                    style={{ width: `${subProgress}%` }}
                   />
                 </div>
               </div>
@@ -450,6 +318,12 @@ function MonitorContent() {
                 );
               })}
             </div>
+            {status === 'error' && (
+              <div className="mt-auto p-3 bg-red-50 dark:bg-red-500/10 border border-red-100 dark:border-red-500/20 rounded-lg flex items-start gap-2">
+                <AlertCircle size={16} className="text-red-500 shrink-0 mt-0.5" />
+                <p className="text-xs text-red-600 dark:text-red-400 break-all">{errorMsg}</p>
+              </div>
+            )}
           </div>
         </div>
 
@@ -461,7 +335,13 @@ function MonitorContent() {
 
 export default function MonitorPage() {
   return (
-    <Suspense fallback={<div className="p-8 text-zinc-500">Loading monitor...</div>}>
+    <Suspense
+      fallback={
+        <div className="p-8 text-zinc-500 h-full flex items-center justify-center">
+          <Loader2 className="animate-spin" />
+        </div>
+      }
+    >
       <MonitorContent />
     </Suspense>
   );

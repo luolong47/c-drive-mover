@@ -57,11 +57,11 @@ export async function saveTask(task: MoveTask): Promise<void> {
 }
 
 export async function runMigration(task_id: string): Promise<void> {
-  await invoke('run_migration', { task_id });
+  await invoke('run_migration', { taskId: task_id });
 }
 
 export async function restoreTask(task_id: string): Promise<void> {
-  await invoke('restore_task', { task_id });
+  await invoke('restore_task', { taskId: task_id });
 }
 
 export async function getHomeDir(): Promise<string> {

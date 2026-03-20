@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 use sysinfo::Disks;
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Manager, State, Emitter};
 use walkdir::WalkDir;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -86,30 +86,42 @@ fn get_config_dir(app_handle: &AppHandle) -> PathBuf {
 
 fn get_db_path(app_handle: &AppHandle) -> PathBuf {
     let mut path = get_config_dir(app_handle);
-    path.push("tasks.db");
-    path
-}
-
-fn get_settings_file(app_handle: &AppHandle) -> PathBuf {
-    let mut path = get_config_dir(app_handle);
-    path.push("settings.json");
+    path.push("c-drive-mover.db");
     path
 }
 
 #[tauri::command]
-fn get_settings(app: AppHandle) -> AppSettings {
-    let path = get_settings_file(&app);
-    if !path.exists() {
-        return AppSettings::default();
+fn get_settings(db: State<DbState>) -> AppSettings {
+    let conn = db.0.lock().unwrap();
+    let stmt = conn
+        .prepare("SELECT value FROM settings WHERE key = 'app_settings'")
+        .ok();
+
+    if let Some(mut stmt) = stmt {
+        let settings_json: Option<String> = stmt
+            .query_row([], |row| row.get(0))
+            .ok();
+
+        if let Some(json) = settings_json {
+            if let Ok(settings) = serde_json::from_str(&json) {
+                return settings;
+            }
+        }
     }
-    let content = fs::read_to_string(path).unwrap_or_default();
-    serde_json::from_str(&content).unwrap_or_else(|_| AppSettings::default())
+    AppSettings::default()
 }
 
 #[tauri::command]
-fn save_settings(app: AppHandle, settings: AppSettings) -> Result<(), String> {
-    let content = serde_json::to_string(&settings).map_err(|e| e.to_string())?;
-    fs::write(get_settings_file(&app), content).map_err(|e| e.to_string())?;
+fn save_settings(db: State<DbState>, settings: AppSettings) -> Result<(), String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let json = serde_json::to_string(&settings).map_err(|e| e.to_string())?;
+
+    conn.execute(
+        "INSERT INTO settings (key, value) VALUES ('app_settings', ?1)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        params![json],
+    )
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -263,10 +275,35 @@ fn save_task(db: State<DbState>, task: MoveTask) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct MigrationEvent {
+    pub msg: String,
+    pub event_type: String, // "info", "warn", "error", "success"
+}
+
+fn emit_log(app_handle: &AppHandle, msg: String, event_type: &str) {
+    let _ = app_handle.emit(
+        "migration-log",
+        MigrationEvent {
+            msg,
+            event_type: event_type.to_string(),
+        },
+    );
+}
+
 #[tauri::command]
-async fn run_migration(db: State<'_, DbState>, task_id: String) -> Result<(), String> {
+async fn run_migration(
+    app_handle: AppHandle,
+    db: State<'_, DbState>,
+    task_id: String,
+) -> Result<(), String> {
+    emit_log(&app_handle, format!("开始执行任务: {}", task_id), "info");
+    log::info!("Starting migration for task ID: {}", task_id);
     let task = {
-        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        let conn = db.0.lock().map_err(|e| {
+            log::error!("Database lock failed: {}", e);
+            e.to_string()
+        })?;
         let mut stmt = conn
             .prepare("SELECT id, name, target_base, status, error, created_at, finished_at FROM tasks WHERE id = ?")
             .map_err(|e| e.to_string())?;
@@ -282,7 +319,10 @@ async fn run_migration(db: State<'_, DbState>, task_id: String) -> Result<(), St
                 finished_at: row.get(6)?,
                 sources: Vec::new(),
             })
-        }).map_err(|_| "Task not found".to_string())?;
+        }).map_err(|e| {
+            log::error!("Task {} not found in database: {}", task_id, e);
+            "找不到指定的迁移任务".to_string()
+        })?;
 
         let mut source_stmt = conn
             .prepare("SELECT path, size FROM task_sources WHERE task_id = ?")
@@ -303,55 +343,115 @@ async fn run_migration(db: State<'_, DbState>, task_id: String) -> Result<(), St
         task
     };
 
+    emit_log(
+        &app_handle,
+        format!("任务准备就绪: {}, 源目录数: {}", task.name, task.sources.len()),
+        "info",
+    );
+
+    log::info!("Updating task status to 'running'...");
     {
         let mut running_task = task.clone();
         running_task.status = "running".to_string();
-        save_task(db.clone(), running_task)?;
+        running_task.error = None;
+        save_task(db.clone(), running_task).map_err(|e| {
+            log::error!("Failed to save 'running' status: {}", e);
+            e
+        })?;
     }
 
     let target_root = Path::new(&task.target_base).join(&task.name);
+    log::info!("Target root directory: {:?}", target_root);
+
     let mut has_error = false;
     let mut error_msg = String::new();
 
     for source in &task.sources {
         let source_path = Path::new(&source.path);
-        let folder_name = source_path.file_name().ok_or("Invalid source path")?;
+        let folder_name = source_path.file_name().ok_or("无效的源路径")?;
         let target_path = target_root.join(folder_name);
 
+        emit_log(
+            &app_handle,
+            format!("正在处理: {}", source.path),
+            "info",
+        );
+        log::info!("Processing source: {:?} -> {:?}", source_path, target_path);
+
+        if !source_path.exists() {
+            has_error = true;
+            error_msg = format!("源目录不存在: {}", source.path);
+            emit_log(&app_handle, error_msg.clone(), "error");
+            log::error!("{}", error_msg);
+            break;
+        }
+
         if let Some(parent) = target_path.parent() {
-            if let Err(e) = fs::create_dir_all(parent) {
-                has_error = true;
-                error_msg = format!("Failed to create target parent: {}", e);
-                break;
+            if !parent.exists() {
+                log::info!("Creating parent directory: {:?}", parent);
+                if let Err(e) = fs::create_dir_all(parent) {
+                    has_error = true;
+                    error_msg = format!("无法创建目标父目录 {:?}: {}", parent, e);
+                    emit_log(&app_handle, error_msg.clone(), "error");
+                    log::error!("{}", error_msg);
+                    break;
+                }
             }
         }
 
+        if target_path.exists() {
+            has_error = true;
+            error_msg = format!("目标目录已存在，迁移中止以防止数据覆盖: {:?}", target_path);
+            emit_log(&app_handle, error_msg.clone(), "error");
+            log::error!("{}", error_msg);
+            break;
+        }
+
+        emit_log(&app_handle, "正在移动目录文件...".to_string(), "info");
+        log::info!("Moving directory...");
         let options = fs_extra::dir::CopyOptions::new().content_only(false);
         if let Err(e) = fs_extra::dir::move_dir(source_path, &target_root, &options) {
             has_error = true;
-            error_msg = format!("无法移动目录 {}: {}", source.path, e);
+            error_msg = format!("无法移动目录 {}: {}. 请确保没有程序正在使用该目录。", source.path, e);
+            emit_log(&app_handle, error_msg.clone(), "error");
+            log::error!("{}", error_msg);
             break;
         }
 
         #[cfg(windows)]
         {
+            emit_log(&app_handle, "创建 Windows 目录联接 (Junction)...".to_string(), "info");
+            log::info!("Creating junction point at {:?}", source_path);
             if let Err(e) = junction::create(&target_path, source_path) {
                 has_error = true;
-                error_msg = format!("无法为 {} 创建目录联接: {}", source.path, e);
+                error_msg = format!("无法为 {} 创建目录联接: {}. 迁移已完成但联接失败。", source.path, e);
+                emit_log(&app_handle, error_msg.clone(), "error");
+                log::error!("{}", error_msg);
                 break;
             }
         }
+        emit_log(&app_handle, format!("已成功迁移: {}", source.path), "success");
     }
 
     let mut final_task = task.clone();
     if has_error {
+        log::warn!("Migration finished with error: {}", error_msg);
         final_task.status = "failed".to_string();
         final_task.error = Some(error_msg.clone());
+        emit_log(&app_handle, "迁移任务失败".to_string(), "error");
     } else {
+        log::info!("Migration completed successfully!");
         final_task.status = "success".to_string();
         final_task.finished_at = Some(now_timestamp());
+        final_task.error = None;
+        emit_log(&app_handle, "所有目录迁移成功完成！".to_string(), "success");
     }
-    save_task(db, final_task)?;
+
+    if let Err(e) = save_task(db, final_task) {
+        log::error!("Failed to save final task status: {}", e);
+        emit_log(&app_handle, "任务已执行但保存状态失败".to_string(), "warn");
+        return Err(format!("任务已执行但保存状态失败: {}", e));
+    }
 
     if has_error {
         Err(error_msg)
@@ -361,9 +461,18 @@ async fn run_migration(db: State<'_, DbState>, task_id: String) -> Result<(), St
 }
 
 #[tauri::command]
-async fn restore_task(db: State<'_, DbState>, task_id: String) -> Result<(), String> {
+async fn restore_task(
+    app_handle: AppHandle,
+    db: State<'_, DbState>,
+    task_id: String,
+) -> Result<(), String> {
+    emit_log(&app_handle, format!("开始还原任务: {}", task_id), "info");
+    log::info!("Starting restore for task ID: {}", task_id);
     let task = {
-        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        let conn = db.0.lock().map_err(|e| {
+            log::error!("Database lock failed: {}", e);
+            e.to_string()
+        })?;
         let mut stmt = conn
             .prepare("SELECT id, name, target_base, status, error, created_at, finished_at FROM tasks WHERE id = ?")
             .map_err(|e| e.to_string())?;
@@ -379,7 +488,10 @@ async fn restore_task(db: State<'_, DbState>, task_id: String) -> Result<(), Str
                 finished_at: row.get(6)?,
                 sources: Vec::new(),
             })
-        }).map_err(|_| "找不到任务".to_string())?;
+        }).map_err(|e| {
+            log::error!("Task {} not found: {}", task_id, e);
+            "找不到指定的迁移任务".to_string()
+        })?;
 
         let mut source_stmt = conn
             .prepare("SELECT path, size FROM task_sources WHERE task_id = ?")
@@ -400,57 +512,92 @@ async fn restore_task(db: State<'_, DbState>, task_id: String) -> Result<(), Str
         task
     };
 
+    log::info!("Updating task status to 'running' for restore...");
+    {
+        let mut running_task = task.clone();
+        running_task.status = "running".to_string();
+        save_task(db.clone(), running_task).map_err(|e| {
+            log::error!("Failed to save status: {}", e);
+            e
+        })?;
+    }
+
     let target_root = Path::new(&task.target_base).join(&task.name);
     let mut has_error = false;
     let mut error_msg = String::new();
 
     for source in &task.sources {
         let source_path = Path::new(&source.path);
-        let folder_name = source_path.file_name().ok_or("Invalid path")?;
+        let folder_name = source_path.file_name().ok_or("无效的路径")?;
         let target_path = target_root.join(folder_name);
+
+        emit_log(&app_handle, format!("正在还原: {}", source.path), "info");
+        log::info!("Restoring source: {:?} <- {:?}", source_path, target_path);
 
         #[cfg(windows)]
         {
             if source_path.exists() {
+                log::info!("Checking if {:?} is a junction...", source_path);
                 if junction::exists(source_path).unwrap_or(false) {
+                    log::info!("Removing junction point at {:?}", source_path);
                     if let Err(e) = std::fs::remove_dir(source_path) {
                         has_error = true;
-                        error_msg = format!("无法删除联接 {}: {}", source.path, e);
+                        error_msg = format!("无法删除目录联接 {}: {}. 请检查权限或是否被占用。", source.path, e);
+                        emit_log(&app_handle, error_msg.clone(), "error");
+                        log::error!("{}", error_msg);
                         break;
                     }
                 } else {
                     has_error = true;
-                    error_msg = format!("路径 {} 已存在且不是联接，无法还原", source.path);
+                    error_msg = format!("路径 {} 已存在且不是联接点，还原中止以防止数据覆盖。", source.path);
+                    emit_log(&app_handle, error_msg.clone(), "error");
+                    log::error!("{}", error_msg);
                     break;
                 }
             }
         }
 
         if target_path.exists() {
+            emit_log(&app_handle, "正在将数据移回 C 盘...".to_string(), "info");
+            log::info!("Moving directory back to C drive...");
             let options = fs_extra::dir::CopyOptions::new().content_only(false);
-            let parent = source_path.parent().unwrap();
+            let parent = source_path.parent().ok_or("无法获取源路径父目录")?;
             if let Err(e) = fs_extra::dir::move_dir(&target_path, parent, &options) {
                 has_error = true;
-                error_msg = format!("无法移回数据 {}: {}", source.path, e);
+                error_msg = format!("无法将数据移回 {}: {}. 请确保目标位置可写。", source.path, e);
+                emit_log(&app_handle, error_msg.clone(), "error");
+                log::error!("{}", error_msg);
                 break;
             }
+        } else {
+            log::warn!("Target directory {:?} does not exist, skipping move.", target_path);
         }
+        emit_log(&app_handle, format!("已成功还原: {}", source.path), "success");
     }
 
     let mut final_task = task.clone();
     if has_error {
+        log::error!("Restore failed: {}", error_msg);
         final_task.status = "failed".to_string();
         final_task.error = Some(format!("还原失败: {}", error_msg));
+        emit_log(&app_handle, "还原任务失败".to_string(), "error");
     } else {
+        log::info!("Restore completed successfully!");
         final_task.status = "pending".to_string();
         final_task.error = None;
         final_task.finished_at = None;
+        emit_log(&app_handle, "所有目录还原成功完成！".to_string(), "success");
 
         if target_root.exists() {
             let _ = std::fs::remove_dir(&target_root);
         }
     }
-    save_task(db, final_task)?;
+
+    if let Err(e) = save_task(db, final_task) {
+        log::error!("Failed to save final status: {}", e);
+        emit_log(&app_handle, "还原操作已执行但状态保存失败".to_string(), "warn");
+        return Err(format!("还原操作已执行但状态保存失败: {}", e));
+    }
 
     if has_error {
         Err(error_msg)
@@ -608,7 +755,16 @@ fn select_directory() -> Option<String> {
 
 fn init_db(app_handle: &AppHandle) -> Result<(), String> {
     let db_path = get_db_path(app_handle);
-    let mut conn = Connection::open(db_path).map_err(|e| e.to_string())?;
+    let conn = Connection::open(db_path).map_err(|e| e.to_string())?;
+
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
 
     conn.execute(
         "CREATE TABLE IF NOT EXISTS tasks (
@@ -636,54 +792,64 @@ fn init_db(app_handle: &AppHandle) -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
 
-    // 尝试从原本位于可执行文件旁的 Data 目录迁移（如果有）
-    let old_data_dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-        .map(|mut p| {
-            p.push("Data");
-            p
-        });
+    // --- Data Migration Logic ---
+    let app_data_dir = app_handle.path().app_data_dir().unwrap_or_default();
+    let exe_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(|p| p.to_path_buf())).unwrap_or_default();
 
-    if let Some(old_dir) = old_data_dir {
-        let old_db = old_dir.join("tasks.db");
-        if old_db.exists() && old_db != get_db_path(app_handle) {
-            // 如果旧位置有数据库且不是当前位置，则尝试简单合并或提示（此处简单处理：如果新数据库为空则移动过来）
-            // 注意：由于 Connection 已打开，此处不适合直接移动文件。
-            // 实际上对于开发环境，只要指向了 AppData，以后就不会再被清理。
+    // 1. Migrate from old tasks.db to current c-drive-mover.db
+    let old_db_path = app_data_dir.join("tasks.db");
+    if old_db_path.exists() {
+        let old_conn = Connection::open(&old_db_path).ok();
+        if let Some(old_conn) = old_conn {
+             let stmt = old_conn.prepare("SELECT id, name, target_base, status, error, created_at, finished_at FROM tasks").ok();
+             if let Some(mut stmt) = stmt {
+                 let tasks_iter = stmt.query_map([], |row| {
+                    Ok(MoveTask {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        target_base: row.get(2)?,
+                        status: row.get(3)?,
+                        error: row.get(4)?,
+                        created_at: row.get(5)?,
+                        finished_at: row.get(6)?,
+                        sources: Vec::new(),
+                    })
+                 }).ok();
+                 
+                 if let Some(iter) = tasks_iter {
+                     for task in iter.filter_map(|t| t.ok()) {
+                         // Insert task
+                         conn.execute("INSERT OR IGNORE INTO tasks (id, name, target_base, status, error, created_at, finished_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                            params![task.id, task.name, task.target_base, task.status, task.error, task.created_at, task.finished_at]).ok();
+                         
+                         // Migrate sources
+                         let src_stmt = old_conn.prepare("SELECT path, size FROM task_sources WHERE task_id = ?").ok();
+                         if let Some(mut src_stmt) = src_stmt {
+                             let src_iter = src_stmt.query_map([&task.id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, u64>(1)?))).ok();
+                             if let Some(src_iter) = src_iter {
+                                 for src in src_iter.filter_map(|s| s.ok()) {
+                                     conn.execute("INSERT INTO task_sources (task_id, path, size) VALUES (?, ?, ?)", params![task.id, src.0, src.1]).ok();
+                                 }
+                             }
+                         }
+                     }
+                 }
+             }
         }
+        let _ = fs::rename(&old_db_path, app_data_dir.join("tasks.db.bak"));
+    }
 
-        // 兼容旧的 JSON 迁移
-        let tasks_json_path = old_dir.join("tasks.json");
-        if tasks_json_path.exists() {
-            if let Ok(content) = fs::read_to_string(&tasks_json_path) {
-                if let Ok(tasks) = serde_json::from_str::<Vec<MoveTask>>(&content) {
-                    let tx = conn.transaction().map_err(|e| e.to_string())?;
-                    for task in tasks {
-                        tx.execute(
-                            "INSERT OR IGNORE INTO tasks (id, name, target_base, status, error, created_at, finished_at)
-                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                            params![
-                                task.id,
-                                task.name,
-                                task.target_base,
-                                task.status,
-                                task.error,
-                                task.created_at,
-                                task.finished_at,
-                            ],
-                        ).ok();
-                        for source in task.sources {
-                            tx.execute(
-                                "INSERT INTO task_sources (task_id, path, size) VALUES (?, ?, ?)",
-                                params![task.id, source.path, source.size],
-                            ).ok();
-                        }
-                    }
-                    tx.commit().ok();
+    // 2. Migrate settings from JSON (AppData or ExeDir)
+    let json_paths = vec![app_data_dir.join("settings.json"), exe_dir.join("Data").join("settings.json")];
+    for jp in json_paths {
+        if jp.exists() {
+            if let Ok(content) = fs::read_to_string(&jp) {
+                if let Ok(settings) = serde_json::from_str::<AppSettings>(&content) {
+                    let json = serde_json::to_string(&settings).unwrap();
+                    conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('app_settings', ?)", [json]).ok();
                 }
             }
-            let _ = fs::rename(&tasks_json_path, old_dir.join("tasks.json.bak"));
+            let _ = fs::rename(&jp, jp.with_extension("json.bak"));
         }
     }
 

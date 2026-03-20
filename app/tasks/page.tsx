@@ -10,8 +10,9 @@ import {
   Search,
 } from 'lucide-react';
 import Link from 'next/link';
+import { useRouter } from 'next/navigation';
 import { useCallback, useEffect, useState } from 'react';
-import { getTasks, type MoveTask, restoreTask, runMigration } from '@/lib/tauri-api';
+import { getTasks, type MoveTask, restoreTask } from '@/lib/tauri-api';
 import { formatBytes } from '@/lib/utils';
 
 const statusConfig: Record<string, { label: string; color: string; bg: string }> = {
@@ -38,6 +39,7 @@ const statusConfig: Record<string, { label: string; color: string; bg: string }>
 };
 
 export default function TasksPage() {
+  const router = useRouter();
   const [tasks, setTasks] = useState<MoveTask[]>([]);
   const [loading, setLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState('');
@@ -58,26 +60,22 @@ export default function TasksPage() {
     fetchTasks();
   }, [fetchTasks]);
 
-  const handleRunTask = async (task_id: string) => {
-    try {
-      setTasks((prev) => prev.map((t) => (t.id === task_id ? { ...t, status: 'running' } : t)));
-      await runMigration(task_id);
-      fetchTasks();
-    } catch (err) {
-      console.error('Migration failed:', err);
-      fetchTasks();
-    }
+  const handleRunTask = (task_id: string) => {
+    router.push(`/monitor?taskId=${task_id}`);
   };
 
   const handleRestoreTask = async (task_id: string) => {
-    if (!confirm('确定要从目标盘恢复数据到 C 盘吗？')) return;
+    if (!confirm('确定要从目标盘恢复数据到 C 盘吗？这将删除现有的目录联接并移回原始数据。')) return;
     try {
-      setTasks((prev) => prev.map((t) => (t.id === task_id ? { ...t, status: 'running' } : t)));
+      setTasks((prev) =>
+        prev.map((t) => (t.id === task_id ? { ...t, status: 'running', error: undefined } : t)),
+      );
       await restoreTask(task_id);
-      fetchTasks();
+      await fetchTasks();
     } catch (err) {
       console.error('Restore failed:', err);
-      fetchTasks();
+      alert(`还原失败: ${err}`);
+      await fetchTasks();
     }
   };
 
