@@ -32,3 +32,5 @@ everything-sdk = "0.0.6"
 rfd = "0.15"
 tauri-plugin-sql = "2"
 rusqlite = { version = "0.32", features = ["bundled"] }
+reqwest = { version = "0.12", features = ["json", "multipart", "stream"] }
+base64 = "0.22"

@@ -5,7 +5,7 @@
   "scripts": {
     "lint": "biome check --write .",
     "prebuild": "(sudo taskkill /F /IM c-drive-mover.exe /T 2>nul || type nul) & pnpm lint",
-    "build": "tauri build && node -e \"const fs=require('fs'); if(!fs.existsSync('dist/release'))fs.mkdirSync('dist/release', {recursive:true}); fs.copyFileSync('src-tauri/target/release/c-drive-mover.exe', 'dist/release/c-drive-mover.exe')\""
+    "build": "set NEXT_PRIVATE_LOCAL_SKIP_WASM_HASH=1&& tauri build && node -e \"const fs=require('fs'); if(!fs.existsSync('dist/release'))fs.mkdirSync('dist/release', {recursive:true}); fs.copyFileSync('src-tauri/target/release/c-drive-mover.exe', 'dist/release/c-drive-mover.exe')\""
   },
   "dependencies": {
     "@google/genai": "^1.17.0",

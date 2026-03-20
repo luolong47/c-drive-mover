@@ -44,6 +44,10 @@ export interface AppSettings {
   default_target_base: string;
   silent_check: boolean;
   blacklist: string[];
+  webdav_url?: string;
+  webdav_username?: string;
+  webdav_password?: string;
+  webdav_folder?: string;
 }
 
 export async function getDiskInfo(): Promise<DiskInfo[]> {
@@ -100,4 +104,16 @@ export async function getSettings(): Promise<AppSettings> {
 
 export async function saveSettings(settings: AppSettings): Promise<void> {
   await invoke('save_settings', { settings });
+}
+
+export async function webdavBackup(settings: AppSettings): Promise<void> {
+  await invoke('webdav_backup', { settings });
+}
+
+export async function webdavRestore(): Promise<void> {
+  await invoke('webdav_restore');
+}
+
+export async function testWebdavConnection(settings: AppSettings): Promise<void> {
+  await invoke('test_webdav_connection', { settings });
 }

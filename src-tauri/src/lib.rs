@@ -1,6 +1,7 @@
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -8,6 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sysinfo::Disks;
 use tauri::{AppHandle, Manager, State, Emitter};
 use walkdir::WalkDir;
+use base64::prelude::*;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct DiskInfo {
@@ -57,6 +59,10 @@ pub struct AppSettings {
     pub default_target_base: String,
     pub silent_check: bool,
     pub blacklist: Vec<String>,
+    pub webdav_url: Option<String>,
+    pub webdav_username: Option<String>,
+    pub webdav_password: Option<String>,
+    pub webdav_folder: Option<String>,
 }
 
 impl Default for AppSettings {
@@ -69,6 +75,10 @@ impl Default for AppSettings {
                 "C:\\Program Files".to_string(),
                 "C:\\Program Files (x86)".to_string(),
             ],
+            webdav_url: None,
+            webdav_username: None,
+            webdav_password: None,
+            webdav_folder: Some("c-drive-mover".to_string()),
         }
     }
 }
@@ -1021,6 +1031,179 @@ fn init_db(app_handle: &AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+#[tauri::command]
+async fn test_webdav_connection(settings: AppSettings) -> Result<(), String> {
+    let url = settings.webdav_url.as_deref().ok_or("WebDAV URL 未配置")?;
+    let username = settings.webdav_username.as_deref().ok_or("WebDAV 用户名未配置")?;
+    let password = settings.webdav_password.as_deref().ok_or("WebDAV 密码未配置")?;
+    let folder = settings.webdav_folder.as_deref().filter(|f| !f.trim().is_empty());
+
+    let client = reqwest::Client::builder()
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+        .build()
+        .map_err(|e| format!("无法初始化客户端: {}", e))?;
+
+    let base_url = url.trim_end_matches('/');
+
+    if let Some(folder_name) = folder {
+        let folder_url = format!("{}/{}", base_url, folder_name.trim_matches('/'));
+        
+        // 1. 尝试创建文件夹 (MKCOL)
+        let mkcol_res = client.request(reqwest::Method::from_bytes(b"MKCOL").unwrap(), &folder_url)
+            .basic_auth(username, Some(password))
+            .send()
+            .await
+            .map_err(|e| format!("MKCOL 请求失败: {}", e))?;
+
+        let status = mkcol_res.status();
+        if !status.is_success() && status != reqwest::StatusCode::METHOD_NOT_ALLOWED && status != reqwest::StatusCode::FORBIDDEN {
+             let body = mkcol_res.text().await.unwrap_or_default();
+             return Err(format!("创建目录失败 (HTTP {})\nURL: {}\n响应: {}", status, folder_url, body));
+        }
+        
+        // 2. 验证路径是否可用
+        let prop_res = client.request(reqwest::Method::from_bytes(b"PROPFIND").unwrap(), &folder_url)
+            .basic_auth(username, Some(password))
+            .header("Depth", "0")
+            .send()
+            .await
+            .map_err(|e| format!("验证目录失败: {}", e))?;
+
+        if !prop_res.status().is_success() {
+            let status = prop_res.status();
+            let body = prop_res.text().await.unwrap_or_default();
+            return Err(format!("远程目录验证失败 (HTTP {})\n请检查文件夹名是否包含无效字符。\nURL: {}\n响应: {}", status, folder_url, body));
+        }
+    } else {
+        let res = client.request(reqwest::Method::from_bytes(b"PROPFIND").unwrap(), base_url)
+            .basic_auth(username, Some(password))
+            .header("Depth", "0")
+            .send()
+            .await
+            .map_err(|e| format!("连接基础 URL 失败: {}", e))?;
+
+        if !res.status().is_success() {
+            let status = res.status();
+            let body = res.text().await.unwrap_or_default();
+            return Err(format!("认证失败或服务器不可用 (HTTP {})\nURL: {}\n响应: {}", status, base_url, body));
+        }
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn webdav_backup(app_handle: AppHandle, settings: AppSettings) -> Result<(), String> {
+    let url = settings.webdav_url.as_deref().ok_or("WebDAV URL 未配置")?;
+    let username = settings.webdav_username.as_deref().ok_or("WebDAV 用户名未配置")?;
+    let password = settings.webdav_password.as_deref().ok_or("WebDAV 密码未配置")?;
+    let folder = settings.webdav_folder.as_deref().filter(|f| !f.trim().is_empty());
+
+    let db_path = get_db_path(&app_handle);
+    if !db_path.exists() {
+        return Err("找不到数据库文件".to_string());
+    }
+
+    let mut file = fs::File::open(&db_path).map_err(|e| e.to_string())?;
+    let mut buffer = Vec::new();
+    file.read_to_end(&mut buffer).map_err(|e| e.to_string())?;
+
+    let client = reqwest::Client::builder()
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let base_url = url.trim_end_matches('/');
+
+    // 预检：确保文件夹存在
+    if let Some(f) = folder {
+        let folder_url = format!("{}/{}", base_url, f.trim_matches('/'));
+        let _ = client.request(reqwest::Method::from_bytes(b"MKCOL").unwrap(), &folder_url)
+            .basic_auth(username, Some(password))
+            .send()
+            .await;
+    }
+
+    let target_url = if let Some(f) = folder {
+        format!("{}/{}/c-drive-mover.db", base_url, f.trim_matches('/'))
+    } else {
+        format!("{}/c-drive-mover.db", base_url)
+    };
+
+    let res = client.put(&target_url)
+        .basic_auth(username, Some(password))
+        .body(buffer)
+        .send()
+        .await
+        .map_err(|e| format!("PUT 请求发送失败: {}", e))?;
+
+    if !res.status().is_success() {
+        let status = res.status();
+        let body = res.text().await.unwrap_or_default();
+        return Err(format!("WebDAV 备份上传失败 (HTTP {})\n目标 URL: {}\n后端视角下的目录名: {:?}\n响应: {}", 
+            status, target_url, folder, body));
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn webdav_restore(app_handle: AppHandle, db: State<'_, DbState>) -> Result<(), String> {
+    let settings = get_settings(db.clone());
+    let url = settings.webdav_url.as_deref().ok_or("WebDAV URL 未配置")?;
+    let username = settings.webdav_username.as_deref().ok_or("WebDAV 用户名未配置")?;
+    let password = settings.webdav_password.as_deref().ok_or("WebDAV 密码未配置")?;
+    let folder = settings.webdav_folder.as_deref().filter(|f| !f.trim().is_empty());
+
+    let client = reqwest::Client::builder()
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let base_url = url.trim_end_matches('/');
+    let target_url = if let Some(f) = folder {
+        format!("{}/{}/c-drive-mover.db", base_url, f.trim_matches('/'))
+    } else {
+        format!("{}/c-drive-mover.db", base_url)
+    };
+
+    let res = client.get(&target_url)
+        .basic_auth(username, Some(password))
+        .send()
+        .await
+        .map_err(|e| format!("GET 请求发送失败: {}", e))?;
+
+    if !res.status().is_success() {
+        let status = res.status();
+        let body = res.text().await.unwrap_or_default();
+        return Err(format!("WebDAV 恢复下载失败 (HTTP {})\n目标 URL: {}\n响应: {}", status, target_url, body));
+    }
+
+    let buffer = res.bytes().await.map_err(|e| e.to_string())?;
+    
+    let db_path = get_db_path(&app_handle);
+    let tmp_path = db_path.with_extension("db.tmp");
+
+    // 先写入临时文件，确保下载完整
+    fs::write(&tmp_path, buffer).map_err(|e| e.to_string())?;
+
+    // 只有临时文件写入成功后，才关闭数据库连接并覆盖
+    {
+        let mut conn = db.0.lock().map_err(|e| e.to_string())?;
+        // 暂时替换为内存数据库以释放原文件句柄
+        *conn = Connection::open_in_memory().map_err(|e| e.to_string())?;
+    }
+
+    // 执行覆盖操作
+    fs::rename(&tmp_path, &db_path).map_err(|e| e.to_string())?;
+
+    // 重启应用
+    app_handle.restart();
+
+    #[allow(unreachable_code)]
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1040,7 +1223,10 @@ pub fn run() {
             search_everything,
             select_directory,
             get_settings,
-            save_settings
+            save_settings,
+            webdav_backup,
+            webdav_restore,
+            test_webdav_connection
         ])
         .setup(|app| {
             init_db(app.handle())?;
