@@ -140,21 +140,29 @@ fn get_disk_info() -> Vec<DiskInfo> {
         .collect()
 }
 
-#[tauri::command]
-fn scan_directory(path: String) -> Result<Vec<FileEntry>, String> {
-    let home_dir = dirs::home_dir().unwrap_or_default();
-    let temp_exclude = home_dir.join("AppData").join("Local").join("Temp");
-    let temp_exclude_str = temp_exclude.to_string_lossy().to_lowercase();
+fn is_blacklisted(path: &Path, blacklist: &[String]) -> bool {
+    let path_str = path.to_string_lossy().to_lowercase();
+    let path_fixed = path_str.replace("/", "\\");
+    let path_norm = PathBuf::from(path_fixed);
 
+    blacklist.iter().any(|b| {
+        let b_fixed = b.to_lowercase().replace("/", "\\");
+        let b_norm = PathBuf::from(b_fixed);
+        path_norm == b_norm || path_norm.starts_with(&b_norm)
+    })
+}
+
+#[tauri::command]
+fn scan_directory(db: State<DbState>, path: String) -> Result<Vec<FileEntry>, String> {
+    let settings = get_settings(db);
     let entries = fs::read_dir(path).map_err(|e| e.to_string())?;
     let mut result = Vec::new();
 
     for entry in entries {
         if let Ok(entry) = entry {
             let entry_path = entry.path();
-            let entry_path_str = entry_path.to_string_lossy().to_lowercase();
-
-            if entry_path_str == temp_exclude_str {
+            
+            if is_blacklisted(&entry_path, &settings.blacklist) {
                 continue;
             }
 
@@ -719,12 +727,11 @@ fn get_home_dir() -> String {
 }
 
 #[tauri::command]
-fn search_everything(query: String) -> Result<Vec<FileEntry>, String> {
+fn search_everything(db: State<DbState>, query: String) -> Result<Vec<FileEntry>, String> {
     use everything_sdk::{global, RequestFlags};
 
-    let home_dir = dirs::home_dir()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "C:\\Users".to_string());
+    let settings = get_settings(db.clone());
+    let home_dir = get_home_dir();
 
     let results = (|| -> Result<Vec<FileEntry>, String> {
         let mut everything = global()
@@ -736,12 +743,16 @@ fn search_everything(query: String) -> Result<Vec<FileEntry>, String> {
         }
 
         let mut searcher = everything.searcher();
-        let temp_exclude = format!("{}\\AppData\\Local\\Temp", home_dir);
+        
+        let mut exclude_clause = String::new();
+        for b in &settings.blacklist {
+            exclude_clause.push_str(&format!(" !\"{}\"", b));
+        }
 
         searcher
             .set_search(&format!(
-                "\"{}\" !\"{}\" folder: *{}*",
-                home_dir, temp_exclude, query
+                "\"{}\"{} folder: *{}*",
+                home_dir, exclude_clause, query
             ))
             .set_max(100)
             .set_request_flags(
@@ -775,11 +786,12 @@ fn search_everything(query: String) -> Result<Vec<FileEntry>, String> {
 
     match results {
         Ok(res) if !res.is_empty() => Ok(res),
-        _ => Ok(search_fallback(&home_dir, &query)),
+        _ => Ok(search_fallback(db, &home_dir, &query)),
     }
 }
 
-fn search_fallback(home_dir: &str, query: &str) -> Vec<FileEntry> {
+fn search_fallback(db: State<DbState>, home_dir: &str, query: &str) -> Vec<FileEntry> {
+    let settings = get_settings(db);
     let mut result = Vec::new();
     let query_lower = query.to_lowercase();
 
@@ -809,6 +821,9 @@ fn search_fallback(home_dir: &str, query: &str) -> Vec<FileEntry> {
             let stdout = String::from_utf8_lossy(&output.stdout);
             for line in stdout.lines().take(100) {
                 let path = Path::new(line);
+                if is_blacklisted(path, &settings.blacklist) {
+                    continue;
+                }
                 if let Some(name) = path.file_name() {
                     result.push(FileEntry {
                         name: name.to_string_lossy().into_owned(),
@@ -824,15 +839,12 @@ fn search_fallback(home_dir: &str, query: &str) -> Vec<FileEntry> {
         }
     }
 
-    let temp_exclude = format!("{}\\AppData\\Local\\Temp", home_dir).to_lowercase();
-
     WalkDir::new(home_dir)
         .max_depth(4)
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| {
-            let path_str = e.path().to_string_lossy().to_lowercase();
-            e.file_type().is_dir() && !path_str.starts_with(&temp_exclude)
+            e.file_type().is_dir() && !is_blacklisted(e.path(), &settings.blacklist)
         })
         .filter(|e| {
             e.file_name()
