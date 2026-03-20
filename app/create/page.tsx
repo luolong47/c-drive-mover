@@ -33,6 +33,7 @@ interface FileNode extends FileEntry {
   id: string;
   children?: FileNode[];
   loading?: boolean;
+  loaded?: boolean;
   segments?: { name: string; path: string }[];
   is_match?: boolean;
 }
@@ -55,6 +56,7 @@ function getOrCreateNode(
       is_dir: true,
       size: 0,
       children: [],
+      loaded: false,
     };
     allNodes.set(path, node);
     if (parent) parent.children?.push(node);
@@ -170,7 +172,7 @@ function TreeNode({
   const isExpanded = expandedNodes.has(node.id);
 
   useEffect(() => {
-    if (!searchQuery && isExpanded && !node.children?.length && !node.loading) {
+    if (!searchQuery && isExpanded && !node.loaded && !node.loading) {
       loadDirectory(node);
     }
   }, [searchQuery, isExpanded, node, loadDirectory]);
@@ -307,6 +309,7 @@ function useInitialize(
           is_dir: true,
           size: 0,
           children: [],
+          loaded: false,
         }));
         setRootNodes(nodes);
       } catch (err) {
@@ -349,7 +352,7 @@ function useTaskActions(
   setError: (s: string | null) => void,
 ) {
   const loadDirectory = async (node: FileNode) => {
-    if (node.children?.length || node.loading) return;
+    if (node.loaded || node.loading) return;
     setRootNodes((prev) =>
       prev.map((n) => {
         const update = (curr: FileNode): FileNode => {
@@ -362,11 +365,16 @@ function useTaskActions(
     );
     try {
       const entries = await scanDirectory(node.path);
-      const children = entries.map((e) => ({ ...e, id: e.path, children: [] }));
+      const children = entries.map((e) => ({
+        ...e,
+        id: e.path,
+        children: [],
+        loaded: false,
+      }));
       setRootNodes((prev) =>
         prev.map((n) => {
           const update = (curr: FileNode): FileNode => {
-            if (curr.id === node.id) return { ...curr, children, loading: false };
+            if (curr.id === node.id) return { ...curr, children, loading: false, loaded: true };
             if (curr.children) return { ...curr, children: curr.children.map(update) };
             return curr;
           };
@@ -375,6 +383,16 @@ function useTaskActions(
       );
     } catch (err) {
       console.error('Scan error:', err);
+      setRootNodes((prev) =>
+        prev.map((n) => {
+          const update = (curr: FileNode): FileNode => {
+            if (curr.id === node.id) return { ...curr, loading: false };
+            if (curr.children) return { ...curr, children: curr.children.map(update) };
+            return curr;
+          };
+          return update(n);
+        }),
+      );
     }
   };
   const toggleNode = (node: FileNode) => {
