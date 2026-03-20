@@ -1,9 +1,12 @@
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
-use sysinfo::Disks;
-use walkdir::WalkDir;
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
+use sysinfo::Disks;
+use tauri::{AppHandle, Manager, State};
+use walkdir::WalkDir;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct DiskInfo {
@@ -67,6 +70,8 @@ impl Default for AppSettings {
     }
 }
 
+pub struct DbState(Mutex<Connection>);
+
 fn get_config_dir() -> PathBuf {
     let mut path = std::env::current_exe()
         .ok()
@@ -79,9 +84,9 @@ fn get_config_dir() -> PathBuf {
     path
 }
 
-fn get_tasks_file() -> PathBuf {
+fn get_db_path() -> PathBuf {
     let mut path = get_config_dir();
-    path.push("tasks.json");
+    path.push("tasks.db");
     path
 }
 
@@ -143,7 +148,7 @@ fn scan_directory(path: String) -> Result<Vec<FileEntry>, String> {
 
             let metadata = entry.metadata().ok();
             let is_dir = metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false);
-            
+
             if is_dir {
                 result.push(FileEntry {
                     name: entry.file_name().to_string_lossy().into_owned(),
@@ -171,54 +176,156 @@ async fn get_folder_size(path: String) -> u64 {
 }
 
 #[tauri::command]
-fn get_tasks() -> Result<Vec<MoveTask>, String> {
-    let path = get_tasks_file();
-    if !path.exists() {
-        return Ok(Vec::new());
+fn get_tasks(db: State<DbState>) -> Result<Vec<MoveTask>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, name, target_base, status, error, created_at, finished_at FROM tasks ORDER BY created_at DESC",
+        )
+        .map_err(|e| e.to_string())?;
+
+    let task_iter = stmt
+        .query_map([], |row| {
+            Ok(MoveTask {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                target_base: row.get(2)?,
+                status: row.get(3)?,
+                error: row.get(4)?,
+                created_at: row.get(5)?,
+                finished_at: row.get(6)?,
+                sources: Vec::new(), // Will fill later
+            })
+        })
+        .map_err(|e| e.to_string())?;
+
+    let mut tasks = Vec::new();
+    for task in task_iter {
+        let mut task = task.map_err(|e| e.to_string())?;
+        
+        // Fetch sources for this task
+        let mut source_stmt = conn
+            .prepare("SELECT path, size FROM task_sources WHERE task_id = ?")
+            .map_err(|e| e.to_string())?;
+        
+        let source_iter = source_stmt
+            .query_map([&task.id], |row| {
+                Ok(TaskSource {
+                    path: row.get(0)?,
+                    size: row.get(1)?,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        
+        for source in source_iter {
+            task.sources.push(source.map_err(|e| e.to_string())?);
+        }
+        
+        tasks.push(task);
     }
-    let content = fs::read_to_string(path).map_err(|e| e.to_string())?;
-    let tasks: Vec<MoveTask> = serde_json::from_str(&content).map_err(|e| e.to_string())?;
+    
     Ok(tasks)
 }
 
 #[tauri::command]
-fn save_task(task: MoveTask) -> Result<(), String> {
-    let mut tasks = get_tasks().unwrap_or_default();
-    
-    // Replace if exists, otherwise add
-    if let Some(index) = tasks.iter().position(|t| t.id == task.id) {
-        tasks[index] = task;
-    } else {
-        tasks.push(task);
+fn save_task(db: State<DbState>, task: MoveTask) -> Result<(), String> {
+    let mut conn = db.0.lock().map_err(|e| e.to_string())?;
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+
+    tx.execute(
+        "INSERT INTO tasks (id, name, target_base, status, error, created_at, finished_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(id) DO UPDATE SET
+            name=excluded.name,
+            target_base=excluded.target_base,
+            status=excluded.status,
+            error=excluded.error,
+            finished_at=excluded.finished_at",
+        params![
+            task.id,
+            task.name,
+            task.target_base,
+            task.status,
+            task.error,
+            task.created_at,
+            task.finished_at,
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+
+    // Refresh sources: delete and re-insert
+    tx.execute("DELETE FROM task_sources WHERE task_id = ?", [&task.id])
+        .map_err(|e| e.to_string())?;
+
+    for source in &task.sources {
+        tx.execute(
+            "INSERT INTO task_sources (task_id, path, size) VALUES (?, ?, ?)",
+            params![task.id, source.path, source.size],
+        )
+        .map_err(|e| e.to_string())?;
     }
 
-    let content = serde_json::to_string(&tasks).map_err(|e| e.to_string())?;
-    fs::write(get_tasks_file(), content).map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
     Ok(())
 }
 
 #[tauri::command]
-async fn run_migration(task_id: String) -> Result<(), String> {
-    let mut tasks = get_tasks()?;
-    let task_index = tasks.iter().position(|t| t.id == task_id).ok_or("Task not found")?;
-    
-    // Mark as running
-    tasks[task_index].status = "running".to_string();
-    save_task(tasks[task_index].clone())?;
+async fn run_migration(db: State<'_, DbState>, task_id: String) -> Result<(), String> {
+    // 1. Get task
+    let task = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare("SELECT id, name, target_base, status, error, created_at, finished_at FROM tasks WHERE id = ?")
+            .map_err(|e| e.to_string())?;
+        
+        let mut task = stmt.query_row([&task_id], |row| {
+            Ok(MoveTask {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                target_base: row.get(2)?,
+                status: row.get(3)?,
+                error: row.get(4)?,
+                created_at: row.get(5)?,
+                finished_at: row.get(6)?,
+                sources: Vec::new(),
+            })
+        }).map_err(|_| "Task not found".to_string())?;
 
-    let task = tasks[task_index].clone();
+        let mut source_stmt = conn
+            .prepare("SELECT path, size FROM task_sources WHERE task_id = ?")
+            .map_err(|e| e.to_string())?;
+        
+        let source_iter = source_stmt
+            .query_map([&task_id], |row| {
+                Ok(TaskSource {
+                    path: row.get(0)?,
+                    size: row.get(1)?,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        
+        for source in source_iter {
+            task.sources.push(source.map_err(|e| e.to_string())?);
+        }
+        task
+    };
+
+    // 2. Mark as running
+    {
+        let mut running_task = task.clone();
+        running_task.status = "running".to_string();
+        save_task(db.clone(), running_task)?;
+    }
+
     let target_root = Path::new(&task.target_base).join(&task.name);
-    
-    // Process sources
     let mut has_error = false;
     let mut error_msg = String::new();
 
     for source in &task.sources {
         let source_path = Path::new(&source.path);
-        let folder_name = source_path.file_name().unwrap();
+        let folder_name = source_path.file_name().ok_or("Invalid source path")?;
         let target_path = target_root.join(folder_name);
 
-        // Ensure parent exists
         if let Some(parent) = target_path.parent() {
             if let Err(e) = fs::create_dir_all(parent) {
                 has_error = true;
@@ -227,19 +334,13 @@ async fn run_migration(task_id: String) -> Result<(), String> {
             }
         }
 
-        // 1. 移动实际目录
-        // 注意：fs_extra::dir::move_dir(from, to, options) 会将 from 移动到 to 目录下
-        // 假设 source_path 是 C:\Game, target_root 是 D:\Backup\MyTask
-        // 移动后会变成 D:\Backup\MyTask\Game
         let options = fs_extra::dir::CopyOptions::new().content_only(false);
         if let Err(e) = fs_extra::dir::move_dir(source_path, &target_root, &options) {
-             has_error = true;
-             error_msg = format!("无法移动目录 {}: {}", source.path, e);
-             break;
+            has_error = true;
+            error_msg = format!("无法移动目录 {}: {}", source.path, e);
+            break;
         }
 
-        // 2. 在原位置创建 Junction
-        // 逻辑：在 C:\Game (已消失) 创建联接，指向 D:\Backup\MyTask\Game
         #[cfg(windows)]
         {
             if let Err(e) = junction::create(&target_path, source_path) {
@@ -250,16 +351,16 @@ async fn run_migration(task_id: String) -> Result<(), String> {
         }
     }
 
-    // Refresh tasks for update
-    let mut tasks = get_tasks()?;
+    // 3. Update status
+    let mut final_task = task.clone();
     if has_error {
-        tasks[task_index].status = "failed".to_string();
-        tasks[task_index].error = Some(error_msg.clone());
+        final_task.status = "failed".to_string();
+        final_task.error = Some(error_msg.clone());
     } else {
-        tasks[task_index].status = "success".to_string();
-        tasks[task_index].finished_at = Some(now_timestamp());
+        final_task.status = "success".to_string();
+        final_task.finished_at = Some(now_timestamp());
     }
-    save_task(tasks[task_index].clone())?;
+    save_task(db, final_task)?;
 
     if has_error {
         Err(error_msg)
@@ -269,26 +370,58 @@ async fn run_migration(task_id: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn restore_task(task_id: String) -> Result<(), String> {
-    let tasks = get_tasks()?;
-    let task_index = tasks.iter().position(|t| t.id == task_id).ok_or("找不到任务")?;
-    
-    let task = tasks[task_index].clone();
-    let target_root = Path::new(&task.target_base).join(&task.name);
+async fn restore_task(db: State<'_, DbState>, task_id: String) -> Result<(), String> {
+    // 1. Get task
+    let task = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare("SELECT id, name, target_base, status, error, created_at, finished_at FROM tasks WHERE id = ?")
+            .map_err(|e| e.to_string())?;
+        
+        let mut task = stmt.query_row([&task_id], |row| {
+            Ok(MoveTask {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                target_base: row.get(2)?,
+                status: row.get(3)?,
+                error: row.get(4)?,
+                created_at: row.get(5)?,
+                finished_at: row.get(6)?,
+                sources: Vec::new(),
+            })
+        }).map_err(|_| "找不到任务".to_string())?;
 
+        let mut source_stmt = conn
+            .prepare("SELECT path, size FROM task_sources WHERE task_id = ?")
+            .map_err(|e| e.to_string())?;
+        
+        let source_iter = source_stmt
+            .query_map([&task_id], |row| {
+                Ok(TaskSource {
+                    path: row.get(0)?,
+                    size: row.get(1)?,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        
+        for source in source_iter {
+            task.sources.push(source.map_err(|e| e.to_string())?);
+        }
+        task
+    };
+
+    let target_root = Path::new(&task.target_base).join(&task.name);
     let mut has_error = false;
     let mut error_msg = String::new();
 
     for source in &task.sources {
         let source_path = Path::new(&source.path);
-        let folder_name = source_path.file_name().unwrap();
+        let folder_name = source_path.file_name().ok_or("Invalid path")?;
         let target_path = target_root.join(folder_name);
 
-        // 1. 删除原位置的 Junction
         #[cfg(windows)]
         {
             if source_path.exists() {
-                // 确保它是一个联接
                 if junction::exists(source_path).unwrap_or(false) {
                     if let Err(e) = std::fs::remove_dir(source_path) {
                         has_error = true;
@@ -303,10 +436,8 @@ async fn restore_task(task_id: String) -> Result<(), String> {
             }
         }
 
-        // 2. 将数据移回 C 盘
         if target_path.exists() {
             let options = fs_extra::dir::CopyOptions::new().content_only(false);
-            // target_path 是 D:\Backup\MyTask\Game, parent 是 C:\
             let parent = source_path.parent().unwrap();
             if let Err(e) = fs_extra::dir::move_dir(&target_path, parent, &options) {
                 has_error = true;
@@ -316,22 +447,20 @@ async fn restore_task(task_id: String) -> Result<(), String> {
         }
     }
 
-    // 更新任务状态
-    let mut tasks = get_tasks()?;
+    let mut final_task = task.clone();
     if has_error {
-        tasks[task_index].status = "failed".to_string();
-        tasks[task_index].error = Some(format!("还原失败: {}", error_msg));
+        final_task.status = "failed".to_string();
+        final_task.error = Some(format!("还原失败: {}", error_msg));
     } else {
-        tasks[task_index].status = "pending".to_string(); // 重置为待处理
-        tasks[task_index].error = None;
-        tasks[task_index].finished_at = None;
-        
-        // 清理目标根目录（如果为空）
+        final_task.status = "pending".to_string();
+        final_task.error = None;
+        final_task.finished_at = None;
+
         if target_root.exists() {
             let _ = std::fs::remove_dir(&target_root);
         }
     }
-    save_task(tasks[task_index].clone())?;
+    save_task(db, final_task)?;
 
     if has_error {
         Err(error_msg)
@@ -355,7 +484,6 @@ fn search_everything(query: String) -> Result<Vec<FileEntry>, String> {
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|| "C:\\Users".to_string());
 
-    // 尝试使用 Everything SDK
     let results = (|| -> Result<Vec<FileEntry>, String> {
         let mut everything = global()
             .try_lock()
@@ -369,7 +497,10 @@ fn search_everything(query: String) -> Result<Vec<FileEntry>, String> {
         let temp_exclude = format!("{}\\AppData\\Local\\Temp", home_dir);
 
         searcher
-            .set_search(&format!("\"{}\" !\"{}\" folder: *{}*", home_dir, temp_exclude, query))
+            .set_search(&format!(
+                "\"{}\" !\"{}\" folder: *{}*",
+                home_dir, temp_exclude, query
+            ))
             .set_max(100)
             .set_request_flags(
                 RequestFlags::EVERYTHING_REQUEST_FILE_NAME | RequestFlags::EVERYTHING_REQUEST_PATH,
@@ -378,10 +509,18 @@ fn search_everything(query: String) -> Result<Vec<FileEntry>, String> {
         let query_results = searcher.query();
         let mut result = Vec::new();
         for item in query_results.iter() {
-            let name = item.filename().map_err(|e| e.to_string())?.to_string_lossy().into_owned();
-            let path = item.path().map_err(|e| e.to_string())?.to_string_lossy().into_owned();
+            let name = item
+                .filename()
+                .map_err(|e| e.to_string())?
+                .to_string_lossy()
+                .into_owned();
+            let path = item
+                .path()
+                .map_err(|e| e.to_string())?
+                .to_string_lossy()
+                .into_owned();
             let full_path = format!("{}\\{}", path, name);
-            
+
             result.push(FileEntry {
                 name,
                 path: full_path,
@@ -394,10 +533,7 @@ fn search_everything(query: String) -> Result<Vec<FileEntry>, String> {
 
     match results {
         Ok(res) if !res.is_empty() => Ok(res),
-        _ => {
-            // 降级逻辑
-            Ok(search_fallback(&home_dir, &query))
-        }
+        _ => Ok(search_fallback(&home_dir, &query)),
     }
 }
 
@@ -405,8 +541,6 @@ fn search_fallback(home_dir: &str, query: &str) -> Vec<FileEntry> {
     let mut result = Vec::new();
     let query_lower = query.to_lowercase();
 
-    // 1. 尝试使用 busybox find (如果用户环境有安装)
-    // 语法: busybox find [path] -maxdepth 4 -type d -iname "*query*"
     let mut command = std::process::Command::new("busybox");
     command.args([
         "find",
@@ -448,16 +582,14 @@ fn search_fallback(home_dir: &str, query: &str) -> Vec<FileEntry> {
         }
     }
 
-    // 2. 最终降级：使用 Rust 原生 WalkDir 进行有限深度的扫描
     let temp_exclude = format!("{}\\AppData\\Local\\Temp", home_dir).to_lowercase();
-    
+
     WalkDir::new(home_dir)
         .max_depth(4)
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| {
             let path_str = e.path().to_string_lossy().to_lowercase();
-            // 排除 Temp 目录，但允许隐藏目录（如 .pnpm）
             e.file_type().is_dir() && !path_str.starts_with(&temp_exclude)
         })
         .filter(|e| {
@@ -484,27 +616,99 @@ fn select_directory() -> Option<String> {
         .map(|p| p.to_string_lossy().into_owned())
 }
 
+fn init_db(app_handle: &AppHandle) -> Result<(), String> {
+    let db_path = get_db_path();
+    let mut conn = Connection::open(db_path).map_err(|e| e.to_string())?;
+
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS tasks (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            target_base TEXT NOT NULL,
+            status TEXT NOT NULL,
+            error TEXT,
+            created_at INTEGER NOT NULL,
+            finished_at INTEGER
+        )",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS task_sources (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL,
+            path TEXT NOT NULL,
+            size INTEGER NOT NULL,
+            FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
+        )",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+
+    // Migration logic from JSON
+    let tasks_json_path = get_config_dir().join("tasks.json");
+    if tasks_json_path.exists() {
+        if let Ok(content) = fs::read_to_string(&tasks_json_path) {
+            if let Ok(tasks) = serde_json::from_str::<Vec<MoveTask>>(&content) {
+                let tx = conn.transaction().map_err(|e| e.to_string())?;
+                for task in tasks {
+                    tx.execute(
+                        "INSERT OR IGNORE INTO tasks (id, name, target_base, status, error, created_at, finished_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                        params![
+                            task.id,
+                            task.name,
+                            task.target_base,
+                            task.status,
+                            task.error,
+                            task.created_at,
+                            task.finished_at,
+                        ],
+                    )
+                    .ok();
+                    for source in task.sources {
+                        tx.execute(
+                            "INSERT INTO task_sources (task_id, path, size) VALUES (?, ?, ?)",
+                            params![task.id, source.path, source.size],
+                        )
+                        .ok();
+                    }
+                }
+                tx.commit().ok();
+            }
+        }
+        // Rename or delete after migration
+        let _ = fs::rename(&tasks_json_path, get_config_dir().join("tasks.json.bak"));
+    }
+
+    app_handle.manage(DbState(Mutex::new(conn)));
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-  tauri::Builder::default()
-    .plugin(tauri_plugin_log::Builder::default().build())
-    .invoke_handler(tauri::generate_handler![
-        get_disk_info,
-        scan_directory,
-        get_folder_size,
-        get_tasks,
-        save_task,
-        run_migration,
-        restore_task,
-        get_home_dir,
-        search_everything,
-        select_directory,
-        get_settings,
-        save_settings
-    ])
-    .setup(|_app| {
-        Ok(())
-    })
-    .run(tauri::generate_context!())
-    .expect("error while running tauri application");
+    tauri::Builder::default()
+        .plugin(tauri_plugin_sql::Builder::new().build())
+        .plugin(tauri_plugin_log::Builder::default().build())
+        .invoke_handler(tauri::generate_handler![
+            get_disk_info,
+            scan_directory,
+            get_folder_size,
+            get_tasks,
+            save_task,
+            run_migration,
+            restore_task,
+            get_home_dir,
+            search_everything,
+            select_directory,
+            get_settings,
+            save_settings
+        ])
+        .setup(|app| {
+            init_db(app.handle())?;
+            Ok(())
+        })
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
 }

@@ -30,3 +30,5 @@ walkdir = "2.5"
 dirs = "6.0"
 everything-sdk = "0.0.6"
 rfd = "0.15"
+tauri-plugin-sql = "2"
+rusqlite = { version = "0.32", features = ["bundled"] }
