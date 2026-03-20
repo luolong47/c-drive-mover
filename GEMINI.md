@@ -7,14 +7,13 @@
 - **前端架构**: Next.js 15 (React 19), TailwindCSS 4.x, motion (framer-motion), Recharts.
 - **后端架构**: Tauri 2.0 (Rust), 涉及 `sysinfo` (磁盘监控), `fs_extra` (原子化移动), `junction` (联结点管理).
 - **设计规范**: 遵循 60-30-10 色彩原则，支持深色模式。
-- **数据持久化**: 迁移任务存储在用户本地数据目录的 `c-drive-mover/tasks.json` 中。
+- **数据持久化**: 迁移任务存储在用户本地数据目录的 SQLite 数据库中 (`c-drive-mover.db`)。
 
 ## 关键命令
 
 ### 开发与构建
-- **开发模式**: `pnpm tauri dev` (启动 Next.js 开发服务器并运行 Tauri 窗口)
-- **生产构建**: `pnpm build` (触发 `tauri build`，会自动执行 `next build && next export`)
-- **代码检查**: `pnpm lint` (使用 Biome 进行代码格式化与静态检查)
+- **生产构建**: `pnpm build`
+- **代码检查**: `pnpm lint`
 
 ### 环境依赖
 - **Node.js**: 建议使用 pnpm 管理依赖。
@@ -24,10 +23,15 @@
 ## 目录结构说明
 
 - `app/`: Next.js 路由与页面组件。
+    - `tasks/`: 迁移任务管理列表（已组件化重构）。
+    - `monitor/`: 实时迁移/还原监控页面。
 - `components/`: 通用 UI 组件（遵循 60-30-10 原则）。
-- `lib/tauri-api.ts`: 前端与 Rust 后端的通信桥梁（Tauri Invoke 封装）。
+- `hooks/`: 自定义 React Hooks (如 `use-monitor-task` 用于监听后端事件)。
+- `lib/`:
+    - `tauri-api.ts`: 前端与 Rust 后端的通信桥梁（Tauri Invoke 封装）。
+    - `utils.ts`: 通用工具函数。
 - `src-tauri/`: Rust 后端源码。
-    - `src/lib.rs`: 包含核心业务逻辑：磁盘扫描、目录迁移、联结创建及还原逻辑。
+    - `src/lib.rs`: 核心业务逻辑（SQLite 数据库初始化、磁盘扫描、目录迁移、联结创建及还原逻辑）。
     - `tauri.conf.json`: Tauri 配置文件，定义了构建流程与窗口属性。
 - `biome.json`: Biome 配置文件，替代了传统的 ESLint/Prettier。
 

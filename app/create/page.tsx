@@ -6,6 +6,7 @@ import {
   ChevronRight,
   Folder,
   FolderOpen,
+  Link,
   Loader2,
   Save,
   Search,
@@ -46,6 +47,7 @@ function getOrCreateNode(
   name: string,
   roots: FileNode[],
   parent: FileNode | null,
+  isJunction = false,
 ): FileNode {
   let node = allNodes.get(path);
   if (!node) {
@@ -54,6 +56,7 @@ function getOrCreateNode(
       name: name || path,
       path,
       is_dir: true,
+      is_junction: isJunction,
       size: 0,
       children: [],
       loaded: false,
@@ -61,18 +64,22 @@ function getOrCreateNode(
     allNodes.set(path, node);
     if (parent) parent.children?.push(node);
     else roots.push(node);
+  } else if (isJunction) {
+    // 如果节点已存在但我们现在知道它是 Junction（比如它是搜索结果的叶子节点）
+    node.is_junction = true;
   }
   return node;
 }
 
 function processPath(
-  path: string,
+  fullPath: string,
   query: string,
   allNodes: Map<string, FileNode>,
   roots: FileNode[],
   parentPaths: Set<string>,
+  isJunction = false,
 ) {
-  const parts = path.split('\\');
+  const parts = fullPath.split('\\');
   let currentPath = '';
   let parent: FileNode | null = null;
   let foundFirstMatch = false;
@@ -87,7 +94,16 @@ function processPath(
       currentPath += (currentPath.endsWith('\\') ? '' : '\\') + part;
     }
 
-    const node = getOrCreateNode(allNodes, currentPath, part, roots, parent);
+    // 只有最后一个部分才应用传入的 isJunction 状态
+    const isLast = i === parts.length - 1;
+    const node = getOrCreateNode(
+      allNodes,
+      currentPath,
+      part,
+      roots,
+      parent,
+      isLast ? isJunction : false,
+    );
     if (!foundFirstMatch && parent) parentPaths.add(parent.id);
     if (part.toLowerCase().includes(query.toLowerCase())) {
       foundFirstMatch = true;
@@ -106,7 +122,7 @@ function buildTreeFromPaths(
   const parentPaths = new Set<string>();
 
   for (const entry of entries) {
-    processPath(entry.path, query, allNodes, roots, parentPaths);
+    processPath(entry.path, query, allNodes, roots, parentPaths, entry.is_junction);
   }
   return { roots, parentPaths };
 }
@@ -210,6 +226,11 @@ function TreeNode({
           )}
         </button>
         <div className="text-sm font-medium text-zinc-700 dark:text-zinc-300 truncate flex items-center gap-1">
+          {node.is_junction && (
+            <span title="软链接 / Junction">
+              <Link size={12} className="text-indigo-500 dark:text-indigo-400 shrink-0" />
+            </span>
+          )}
           {node.segments ? (
             node.segments.map((seg, i) => (
               <div key={seg.path} className="flex items-center gap-1">
@@ -307,6 +328,7 @@ function useInitialize(
           name: p.split('\\').pop() || p,
           path: p,
           is_dir: true,
+          is_junction: false,
           size: 0,
           children: [],
           loaded: false,
