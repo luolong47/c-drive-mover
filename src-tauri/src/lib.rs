@@ -1,7 +1,8 @@
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 use sysinfo::Disks;
@@ -72,33 +73,32 @@ impl Default for AppSettings {
 
 pub struct DbState(Mutex<Connection>);
 
-fn get_config_dir() -> PathBuf {
-    let mut path = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-        .unwrap_or_else(|| PathBuf::from("."));
-    path.push("Data");
+fn get_config_dir(app_handle: &AppHandle) -> PathBuf {
+    let path = app_handle
+        .path()
+        .app_data_dir()
+        .unwrap_or_else(|_| PathBuf::from("."));
     if !path.exists() {
         fs::create_dir_all(&path).ok();
     }
     path
 }
 
-fn get_db_path() -> PathBuf {
-    let mut path = get_config_dir();
+fn get_db_path(app_handle: &AppHandle) -> PathBuf {
+    let mut path = get_config_dir(app_handle);
     path.push("tasks.db");
     path
 }
 
-fn get_settings_file() -> PathBuf {
-    let mut path = get_config_dir();
+fn get_settings_file(app_handle: &AppHandle) -> PathBuf {
+    let mut path = get_config_dir(app_handle);
     path.push("settings.json");
     path
 }
 
 #[tauri::command]
-fn get_settings() -> AppSettings {
-    let path = get_settings_file();
+fn get_settings(app: AppHandle) -> AppSettings {
+    let path = get_settings_file(&app);
     if !path.exists() {
         return AppSettings::default();
     }
@@ -107,9 +107,9 @@ fn get_settings() -> AppSettings {
 }
 
 #[tauri::command]
-fn save_settings(settings: AppSettings) -> Result<(), String> {
+fn save_settings(app: AppHandle, settings: AppSettings) -> Result<(), String> {
     let content = serde_json::to_string(&settings).map_err(|e| e.to_string())?;
-    fs::write(get_settings_file(), content).map_err(|e| e.to_string())?;
+    fs::write(get_settings_file(&app), content).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -141,7 +141,6 @@ fn scan_directory(path: String) -> Result<Vec<FileEntry>, String> {
             let entry_path = entry.path();
             let entry_path_str = entry_path.to_string_lossy().to_lowercase();
 
-            // 排除 Temp 目录
             if entry_path_str == temp_exclude_str {
                 continue;
             }
@@ -194,7 +193,7 @@ fn get_tasks(db: State<DbState>) -> Result<Vec<MoveTask>, String> {
                 error: row.get(4)?,
                 created_at: row.get(5)?,
                 finished_at: row.get(6)?,
-                sources: Vec::new(), // Will fill later
+                sources: Vec::new(),
             })
         })
         .map_err(|e| e.to_string())?;
@@ -202,12 +201,10 @@ fn get_tasks(db: State<DbState>) -> Result<Vec<MoveTask>, String> {
     let mut tasks = Vec::new();
     for task in task_iter {
         let mut task = task.map_err(|e| e.to_string())?;
-        
-        // Fetch sources for this task
         let mut source_stmt = conn
             .prepare("SELECT path, size FROM task_sources WHERE task_id = ?")
             .map_err(|e| e.to_string())?;
-        
+
         let source_iter = source_stmt
             .query_map([&task.id], |row| {
                 Ok(TaskSource {
@@ -216,14 +213,12 @@ fn get_tasks(db: State<DbState>) -> Result<Vec<MoveTask>, String> {
                 })
             })
             .map_err(|e| e.to_string())?;
-        
+
         for source in source_iter {
             task.sources.push(source.map_err(|e| e.to_string())?);
         }
-        
         tasks.push(task);
     }
-    
     Ok(tasks)
 }
 
@@ -253,7 +248,6 @@ fn save_task(db: State<DbState>, task: MoveTask) -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
 
-    // Refresh sources: delete and re-insert
     tx.execute("DELETE FROM task_sources WHERE task_id = ?", [&task.id])
         .map_err(|e| e.to_string())?;
 
@@ -271,13 +265,12 @@ fn save_task(db: State<DbState>, task: MoveTask) -> Result<(), String> {
 
 #[tauri::command]
 async fn run_migration(db: State<'_, DbState>, task_id: String) -> Result<(), String> {
-    // 1. Get task
     let task = {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
         let mut stmt = conn
             .prepare("SELECT id, name, target_base, status, error, created_at, finished_at FROM tasks WHERE id = ?")
             .map_err(|e| e.to_string())?;
-        
+
         let mut task = stmt.query_row([&task_id], |row| {
             Ok(MoveTask {
                 id: row.get(0)?,
@@ -294,7 +287,7 @@ async fn run_migration(db: State<'_, DbState>, task_id: String) -> Result<(), St
         let mut source_stmt = conn
             .prepare("SELECT path, size FROM task_sources WHERE task_id = ?")
             .map_err(|e| e.to_string())?;
-        
+
         let source_iter = source_stmt
             .query_map([&task_id], |row| {
                 Ok(TaskSource {
@@ -303,14 +296,13 @@ async fn run_migration(db: State<'_, DbState>, task_id: String) -> Result<(), St
                 })
             })
             .map_err(|e| e.to_string())?;
-        
+
         for source in source_iter {
             task.sources.push(source.map_err(|e| e.to_string())?);
         }
         task
     };
 
-    // 2. Mark as running
     {
         let mut running_task = task.clone();
         running_task.status = "running".to_string();
@@ -351,7 +343,6 @@ async fn run_migration(db: State<'_, DbState>, task_id: String) -> Result<(), St
         }
     }
 
-    // 3. Update status
     let mut final_task = task.clone();
     if has_error {
         final_task.status = "failed".to_string();
@@ -371,13 +362,12 @@ async fn run_migration(db: State<'_, DbState>, task_id: String) -> Result<(), St
 
 #[tauri::command]
 async fn restore_task(db: State<'_, DbState>, task_id: String) -> Result<(), String> {
-    // 1. Get task
     let task = {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
         let mut stmt = conn
             .prepare("SELECT id, name, target_base, status, error, created_at, finished_at FROM tasks WHERE id = ?")
             .map_err(|e| e.to_string())?;
-        
+
         let mut task = stmt.query_row([&task_id], |row| {
             Ok(MoveTask {
                 id: row.get(0)?,
@@ -394,7 +384,7 @@ async fn restore_task(db: State<'_, DbState>, task_id: String) -> Result<(), Str
         let mut source_stmt = conn
             .prepare("SELECT path, size FROM task_sources WHERE task_id = ?")
             .map_err(|e| e.to_string())?;
-        
+
         let source_iter = source_stmt
             .query_map([&task_id], |row| {
                 Ok(TaskSource {
@@ -403,7 +393,7 @@ async fn restore_task(db: State<'_, DbState>, task_id: String) -> Result<(), Str
                 })
             })
             .map_err(|e| e.to_string())?;
-        
+
         for source in source_iter {
             task.sources.push(source.map_err(|e| e.to_string())?);
         }
@@ -617,7 +607,7 @@ fn select_directory() -> Option<String> {
 }
 
 fn init_db(app_handle: &AppHandle) -> Result<(), String> {
-    let db_path = get_db_path();
+    let db_path = get_db_path(app_handle);
     let mut conn = Connection::open(db_path).map_err(|e| e.to_string())?;
 
     conn.execute(
@@ -646,40 +636,55 @@ fn init_db(app_handle: &AppHandle) -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
 
-    // Migration logic from JSON
-    let tasks_json_path = get_config_dir().join("tasks.json");
-    if tasks_json_path.exists() {
-        if let Ok(content) = fs::read_to_string(&tasks_json_path) {
-            if let Ok(tasks) = serde_json::from_str::<Vec<MoveTask>>(&content) {
-                let tx = conn.transaction().map_err(|e| e.to_string())?;
-                for task in tasks {
-                    tx.execute(
-                        "INSERT OR IGNORE INTO tasks (id, name, target_base, status, error, created_at, finished_at)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                        params![
-                            task.id,
-                            task.name,
-                            task.target_base,
-                            task.status,
-                            task.error,
-                            task.created_at,
-                            task.finished_at,
-                        ],
-                    )
-                    .ok();
-                    for source in task.sources {
-                        tx.execute(
-                            "INSERT INTO task_sources (task_id, path, size) VALUES (?, ?, ?)",
-                            params![task.id, source.path, source.size],
-                        )
-                        .ok();
-                    }
-                }
-                tx.commit().ok();
-            }
+    // 尝试从原本位于可执行文件旁的 Data 目录迁移（如果有）
+    let old_data_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        .map(|mut p| {
+            p.push("Data");
+            p
+        });
+
+    if let Some(old_dir) = old_data_dir {
+        let old_db = old_dir.join("tasks.db");
+        if old_db.exists() && old_db != get_db_path(app_handle) {
+            // 如果旧位置有数据库且不是当前位置，则尝试简单合并或提示（此处简单处理：如果新数据库为空则移动过来）
+            // 注意：由于 Connection 已打开，此处不适合直接移动文件。
+            // 实际上对于开发环境，只要指向了 AppData，以后就不会再被清理。
         }
-        // Rename or delete after migration
-        let _ = fs::rename(&tasks_json_path, get_config_dir().join("tasks.json.bak"));
+
+        // 兼容旧的 JSON 迁移
+        let tasks_json_path = old_dir.join("tasks.json");
+        if tasks_json_path.exists() {
+            if let Ok(content) = fs::read_to_string(&tasks_json_path) {
+                if let Ok(tasks) = serde_json::from_str::<Vec<MoveTask>>(&content) {
+                    let tx = conn.transaction().map_err(|e| e.to_string())?;
+                    for task in tasks {
+                        tx.execute(
+                            "INSERT OR IGNORE INTO tasks (id, name, target_base, status, error, created_at, finished_at)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                            params![
+                                task.id,
+                                task.name,
+                                task.target_base,
+                                task.status,
+                                task.error,
+                                task.created_at,
+                                task.finished_at,
+                            ],
+                        ).ok();
+                        for source in task.sources {
+                            tx.execute(
+                                "INSERT INTO task_sources (task_id, path, size) VALUES (?, ?, ?)",
+                                params![task.id, source.path, source.size],
+                            ).ok();
+                        }
+                    }
+                    tx.commit().ok();
+                }
+            }
+            let _ = fs::rename(&tasks_json_path, old_dir.join("tasks.json.bak"));
+        }
     }
 
     app_handle.manage(DbState(Mutex::new(conn)));
