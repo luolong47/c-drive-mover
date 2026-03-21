@@ -9,7 +9,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sysinfo::Disks;
 use tauri::{AppHandle, Manager, State, Emitter};
 use walkdir::WalkDir;
-use base64::prelude::*;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct DiskInfo {
@@ -1207,7 +1206,6 @@ async fn webdav_restore(app_handle: AppHandle, db: State<'_, DbState>) -> Result
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .plugin(tauri_plugin_sql::Builder::new().build())
         .plugin(tauri_plugin_log::Builder::default().build())
         .invoke_handler(tauri::generate_handler![
             get_disk_info,

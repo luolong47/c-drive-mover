@@ -21,7 +21,7 @@ import {
 import { useTheme } from 'next-themes';
 import { useEffect, useState } from 'react';
 import {
-  AppSettings,
+  type AppSettings,
   getSettings,
   saveSettings,
   selectDirectory,
