@@ -168,31 +168,29 @@ fn scan_directory(db: State<DbState>, path: String) -> Result<Vec<FileEntry>, St
     let entries = fs::read_dir(path).map_err(|e| e.to_string())?;
     let mut result = Vec::new();
 
-    for entry in entries {
-        if let Ok(entry) = entry {
-            let entry_path = entry.path();
-            
-            if is_blacklisted(&entry_path, &settings.blacklist) {
-                continue;
-            }
+    for entry in entries.flatten() {
+        let entry_path = entry.path();
+        
+        if is_blacklisted(&entry_path, &settings.blacklist) {
+            continue;
+        }
 
-            // 使用 symlink_metadata 避免跟随链接
-            let metadata = fs::symlink_metadata(&entry_path).ok();
-            if let Some(meta) = metadata {
-                let is_dir = meta.is_dir();
-                let is_junction = junction::exists(&entry_path).unwrap_or(false);
-                
-                // 如果是 Junction，它在 Windows 上元数据中 is_dir 也是 true
-                // 或者如果是符号链接且指向目录，我们也认为它是目录
-                if is_dir || is_junction {
-                    result.push(FileEntry {
-                        name: entry.file_name().to_string_lossy().into_owned(),
-                        path: entry_path.to_string_lossy().into_owned(),
-                        is_dir: true,
-                        is_junction,
-                        size: 0,
-                    });
-                }
+        // 使用 symlink_metadata 避免跟随链接
+        let metadata = fs::symlink_metadata(&entry_path).ok();
+        if let Some(meta) = metadata {
+            let is_dir = meta.is_dir();
+            let is_junction = junction::exists(&entry_path).unwrap_or(false);
+            
+            // 如果是 Junction，它在 Windows 上元数据中 is_dir 也是 true
+            // 或者如果是符号链接且指向目录，我们也认为它是目录
+            if is_dir || is_junction {
+                result.push(FileEntry {
+                    name: entry.file_name().to_string_lossy().into_owned(),
+                    path: entry_path.to_string_lossy().into_owned(),
+                    is_dir: true,
+                    is_junction,
+                    size: 0,
+                });
             }
         }
     }
@@ -200,7 +198,7 @@ fn scan_directory(db: State<DbState>, path: String) -> Result<Vec<FileEntry>, St
 }
 
 #[tauri::command]
-async fn get_folder_size(path: String) -> u64 {
+fn get_folder_size(path: String) -> u64 {
     let mut total_size = 0;
     for entry in WalkDir::new(path).into_iter().filter_map(|e| e.ok()) {
         if let Ok(metadata) = entry.metadata() {
@@ -289,7 +287,7 @@ fn replace_user_dir(path: &str, current_home: &str) -> String {
 }
 
 #[tauri::command]
-async fn check_plans(db: State<'_, DbState>) -> Result<usize, String> {
+fn check_plans(db: State<'_, DbState>) -> Result<usize, String> {
     let tasks = get_tasks_impl(&db)?;
     let mut updated_count = 0;
     
@@ -340,7 +338,7 @@ async fn check_plans(db: State<'_, DbState>) -> Result<usize, String> {
 }
 
 #[tauri::command]
-async fn fix_user_directories(db: State<'_, DbState>) -> Result<usize, String> {
+fn fix_user_directories(db: State<'_, DbState>) -> Result<usize, String> {
     let home_dir = dirs::home_dir().ok_or("无法获取当前用户目录")?;
     let current_home = home_dir.to_string_lossy().to_string();
     
@@ -492,7 +490,7 @@ fn emit_log(app_handle: &AppHandle, db: Option<&DbState>, task_id: &str, msg: St
 }
 
 #[tauri::command]
-async fn run_migration(
+fn run_migration(
     app_handle: AppHandle,
     db: State<'_, DbState>,
     task_id: String,
@@ -716,7 +714,7 @@ async fn run_migration(
 }
 
 #[tauri::command]
-async fn restore_task(
+fn restore_task(
     app_handle: AppHandle,
     db: State<'_, DbState>,
     task_id: String,
@@ -910,7 +908,7 @@ fn search_everything(db: State<DbState>, query: String) -> Result<Vec<FileEntry>
         }
 
         searcher
-            .set_search(&format!(
+            .set_search(format!(
                 "\"{}\"{} folder: *{}*",
                 home_dir, exclude_clause, query
             ))
