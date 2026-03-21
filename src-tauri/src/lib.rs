@@ -633,11 +633,11 @@ fn run_migration(
                 options.overwrite = true;
             }
 
-            emit_log(&app_handle, Some(&db), &task_id, "正在移动目录文件...".to_string(), "info");
-            log::info!("Moving directory...");
+            emit_log(&app_handle, Some(&db), &task_id, "正在复制目录文件...".to_string(), "info");
+            log::info!("Copying directory...");
             
-            // 注意：fs_extra::move_dir(src, dest, options) 会将 src 移动到 dest 目录下
-            // 所以我们需要移动到 target_path 的父目录
+            // 注意：fs_extra::copy(src, dest, options) 会将 src 复制到 dest 目录下
+            // 所以我们需要复制到 target_path 的父目录
             let target_parent = target_path.parent().ok_or("无效的目标路径")?;
 
             // 检查目录占用情况
@@ -661,9 +661,33 @@ fn run_migration(
                 }
             }
 
-            if let Err(e) = fs_extra::dir::move_dir(source_path, target_parent, &options) {
+            // 先执行复制操作
+            if let Err(e) = fs_extra::dir::copy(source_path, target_parent, &options) {
                 has_error = true;
-                error_msg = format!("无法移动目录 {}: {}. 请确保没有程序正在使用该目录。", source.path, e);
+                error_msg = format!("无法复制目录 {}: {}. 请确保没有程序正在使用该目录并且有足够空间。", source.path, e);
+                emit_log(&app_handle, Some(&db), &task_id, error_msg.clone(), "error");
+                log::error!("{}", error_msg);
+                break;
+            }
+
+            // 复制成功后删除源目录
+            emit_log(&app_handle, Some(&db), &task_id, "验证复制完成，正在删除源目录...".to_string(), "info");
+            log::info!("Copy successful, removing source directory...");
+            if let Err(e) = std::fs::remove_dir_all(source_path) {
+                has_error = true;
+                #[cfg(windows)]
+                {
+                    if let Ok(locks) = rm::get_locking_processes(source_path) {
+                        if !locks.is_empty() {
+                            let lock_str = locks.join(", ");
+                            error_msg = format!("LOCKS_DETECTED:{}:{}", serde_json::to_string(&locks).unwrap_or_default(), source.path);
+                            emit_log(&app_handle, Some(&db), &task_id, format!("无法删除源目录，因为正在被以下程序占用: {}", lock_str), "error");
+                            log::error!("{}", error_msg);
+                            break;
+                        }
+                    }
+                }
+                error_msg = format!("无法删除源目录 {}: {}。可能仍被其他程序占用。", source.path, e);
                 emit_log(&app_handle, Some(&db), &task_id, error_msg.clone(), "error");
                 log::error!("{}", error_msg);
                 break;
@@ -846,8 +870,8 @@ fn restore_task(
         }
 
         if target_path.exists() {
-            emit_log(&app_handle, Some(&db), &task_id, "正在将数据移回 C 盘...".to_string(), "info");
-            log::info!("Moving directory back to C drive...");
+            emit_log(&app_handle, Some(&db), &task_id, "正在将数据复制回 C 盘...".to_string(), "info");
+            log::info!("Copying directory back to C drive...");
             let parent = source_path.parent().ok_or("无法获取源路径父目录")?;
 
             // 检查目录占用情况
@@ -878,9 +902,33 @@ fn restore_task(
             let mut options = fs_extra::dir::CopyOptions::new().content_only(false);
             options.overwrite = true; // 开启覆盖模式以支持合并
 
-            if let Err(e) = fs_extra::dir::move_dir(&target_path, parent, &options) {
+            // 先执行复制操作
+            if let Err(e) = fs_extra::dir::copy(&target_path, parent, &options) {
                 has_error = true;
-                error_msg = format!("无法将数据移回 {}: {}. 请确保目标位置可写。", source.path, e);
+                error_msg = format!("无法将数据复制回 {}: {}. 请确保目标位置可写并且有足够空间。", source.path, e);
+                emit_log(&app_handle, Some(&db), &task_id, error_msg.clone(), "error");
+                log::error!("{}", error_msg);
+                break;
+            }
+
+            // 复制成功后删除目标目录（相当于迁移出去的目录）
+            emit_log(&app_handle, Some(&db), &task_id, "验证复制完成，正在清理已迁移的目录...".to_string(), "info");
+            log::info!("Copy successful, removing migrated directory {:?}...", target_path);
+            if let Err(e) = std::fs::remove_dir_all(&target_path) {
+                has_error = true;
+                #[cfg(windows)]
+                {
+                    if let Ok(locks) = rm::get_locking_processes(&target_path) {
+                        if !locks.is_empty() {
+                            let lock_str = locks.join(", ");
+                            error_msg = format!("LOCKS_DETECTED:{}:{}", serde_json::to_string(&locks).unwrap_or_default(), target_path.display());
+                            emit_log(&app_handle, Some(&db), &task_id, format!("无法清理已迁移的目录，因为正在被以下程序占用: {}", lock_str), "error");
+                            log::error!("{}", error_msg);
+                            break;
+                        }
+                    }
+                }
+                error_msg = format!("无法清理已迁移的目录 {}: {}。此错误不影响使用，可后续手动删除。", target_path.display(), e);
                 emit_log(&app_handle, Some(&db), &task_id, error_msg.clone(), "error");
                 log::error!("{}", error_msg);
                 break;
