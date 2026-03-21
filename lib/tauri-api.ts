@@ -12,6 +12,7 @@ export interface FileEntry {
   path: string;
   is_dir: boolean;
   is_junction: boolean;
+  target_path?: string;
   size: number;
 }
 

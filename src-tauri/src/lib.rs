@@ -24,6 +24,7 @@ pub struct FileEntry {
     pub path: String,
     pub is_dir: bool,
     pub is_junction: bool,
+    pub target_path: Option<String>,
     pub size: u64,
 }
 
@@ -184,11 +185,17 @@ fn scan_directory(db: State<DbState>, path: String) -> Result<Vec<FileEntry>, St
             // 如果是 Junction，它在 Windows 上元数据中 is_dir 也是 true
             // 或者如果是符号链接且指向目录，我们也认为它是目录
             if is_dir || is_junction {
+                let target_path = if is_junction {
+                    std::fs::read_link(&entry_path).ok().map(|p| p.to_string_lossy().into_owned())
+                } else {
+                    None
+                };
                 result.push(FileEntry {
                     name: entry.file_name().to_string_lossy().into_owned(),
                     path: entry_path.to_string_lossy().into_owned(),
                     is_dir: true,
                     is_junction,
+                    target_path,
                     size: 0,
                 });
             }
@@ -932,14 +939,22 @@ fn search_everything(db: State<DbState>, query: String) -> Result<Vec<FileEntry>
                 .into_owned();
             let full_path = format!("{}\\{}", path, name);
             let is_junction = junction::exists(&full_path).unwrap_or(false);
-
-            result.push(FileEntry {
-                name,
-                path: full_path,
-                is_dir: true,
-                is_junction,
-                size: 0,
-            });
+            // 这里 Everything 搜索出来的全是 folder
+            if is_junction || true { // it's already a folder search
+                let target_path = if is_junction {
+                    std::fs::read_link(&full_path).ok().map(|p| p.to_string_lossy().into_owned())
+                } else {
+                    None
+                };
+                result.push(FileEntry {
+                    name,
+                    path: full_path,
+                    is_dir: true,
+                    is_junction,
+                    target_path,
+                    size: 0,
+                });
+            }
         }
         Ok(result)
     })();
@@ -985,11 +1000,18 @@ fn search_fallback(db: State<DbState>, home_dir: &str, query: &str) -> Vec<FileE
                     continue;
                 }
                 if let Some(name) = path.file_name() {
+                    let is_junction = junction::exists(line).unwrap_or(false);
+                    let target_path = if is_junction {
+                        std::fs::read_link(line).ok().map(|p| p.to_string_lossy().into_owned())
+                    } else {
+                        None
+                    };
                     result.push(FileEntry {
                         name: name.to_string_lossy().into_owned(),
                         path: line.to_string(),
                         is_dir: true,
-                        is_junction: junction::exists(line).unwrap_or(false),
+                        is_junction,
+                        target_path,
                         size: 0,
                     });
                 }
@@ -1014,12 +1036,22 @@ fn search_fallback(db: State<DbState>, home_dir: &str, query: &str) -> Vec<FileE
                 .contains(&query_lower)
         })
         .take(100)
-        .map(|e| FileEntry {
-            name: e.file_name().to_string_lossy().into_owned(),
-            path: e.path().to_string_lossy().into_owned(),
-            is_dir: true,
-            is_junction: junction::exists(e.path()).unwrap_or(false),
-            size: 0,
+        .map(|e| {
+            let path_str = e.path().to_string_lossy().into_owned();
+            let is_junction = junction::exists(e.path()).unwrap_or(false);
+            let target_path = if is_junction {
+                std::fs::read_link(e.path()).ok().map(|p| p.to_string_lossy().into_owned())
+            } else {
+                None
+            };
+            FileEntry {
+                name: e.file_name().to_string_lossy().into_owned(),
+                path: path_str,
+                is_dir: true,
+                is_junction,
+                target_path,
+                size: 0,
+            }
         })
         .collect()
 }

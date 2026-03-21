@@ -227,7 +227,7 @@ function TreeNode({
         </button>
         <div className="text-sm font-medium text-zinc-700 dark:text-zinc-300 truncate flex items-center gap-1">
           {node.is_junction && (
-            <span title="软链接 / Junction">
+            <span title={node.target_path ? `软链接 -> ${node.target_path}` : '软链接 / Junction'}>
               <Link size={12} className="text-indigo-500 dark:text-indigo-400 shrink-0" />
             </span>
           )}
