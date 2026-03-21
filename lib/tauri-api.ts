@@ -95,6 +95,10 @@ export async function restoreTask(task_id: string): Promise<void> {
   await invoke('restore_task', { taskId: task_id });
 }
 
+export async function killProcesses(process_names: string[]): Promise<void> {
+  await invoke('kill_processes', { processNames: process_names });
+}
+
 export async function getHomeDir(): Promise<string> {
   return await invoke('get_home_dir');
 }

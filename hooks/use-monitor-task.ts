@@ -1,6 +1,13 @@
 import { listen } from '@tauri-apps/api/event';
 import { useCallback, useEffect, useState } from 'react';
-import { getTaskLogs, getTasks, type MoveTask, restoreTask, runMigration } from '@/lib/tauri-api';
+import {
+  getTaskLogs,
+  getTasks,
+  killProcesses,
+  type MoveTask,
+  restoreTask,
+  runMigration,
+} from '@/lib/tauri-api';
 
 export interface LogEntry {
   id: string;
@@ -11,11 +18,14 @@ export interface LogEntry {
 
 export function useMonitorTask(taskId: string | null, action: string | null, stagesCount: number) {
   const [task, setTask] = useState<MoveTask | null>(null);
-  const [status, setStatus] = useState<'idle' | 'running' | 'completed' | 'error'>('idle');
+  const [status, setStatus] = useState<'idle' | 'running' | 'completed' | 'error' | 'locked'>(
+    'idle',
+  );
   const [currentStage, setCurrentStage] = useState(0);
   const [progress, setProgress] = useState(0);
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [lockingProcesses, setLockingProcesses] = useState<string[] | null>(null);
 
   const addLog = useCallback((msg: string, type: LogEntry['type'] = 'info') => {
     const time = new Date().toLocaleTimeString('zh-CN', {
@@ -119,32 +129,94 @@ export function useMonitorTask(taskId: string | null, action: string | null, sta
     };
   }, [addLog, task, updateStageByMsg, taskId]);
 
-  const handleStart = async () => {
+  const handleMigrationError = useCallback(
+    (msg: string) => {
+      if (msg.startsWith('LOCKS_DETECTED:')) {
+        try {
+          const parts = msg.split(':');
+          const pList = JSON.parse(parts[1]);
+          setLockingProcesses(pList);
+          setStatus('locked');
+          setErrorMsg(`目录被程序占用: ${pList.join(', ')}`);
+        } catch (_e) {
+          setStatus('error');
+          setErrorMsg(msg);
+        }
+      } else {
+        setStatus('error');
+        setErrorMsg(msg);
+      }
+      addLog(`任务中止: ${msg}`, 'error');
+    },
+    [addLog],
+  );
+
+  const executeTaskAction = useCallback(
+    async (actionType: string) => {
+      if (!taskId) return;
+      if (actionType === 'restore') {
+        await restoreTask(taskId);
+      } else {
+        await runMigration(taskId);
+      }
+    },
+    [taskId],
+  );
+
+  const resetTaskStatus = useCallback(
+    (msg: string) => {
+      setStatus('running');
+      addLog('--- 开启新操作流程 ---', 'info');
+      setCurrentStage(0);
+      setProgress(5);
+      setErrorMsg(null);
+      setLockingProcesses(null);
+      addLog(msg, 'info');
+    },
+    [addLog],
+  );
+
+  const resolveAction = (overrideAction?: unknown) => {
+    const actualOverride = typeof overrideAction === 'string' ? overrideAction : undefined;
+    const currentAction = actualOverride || action || 'migrate';
+    if (currentAction === 'restore') {
+      const confirmed = confirm(
+        '确定要从目标盘恢复数据到 C 盘吗？这将删除现有的目录联接并移回原始数据。',
+      );
+      if (!confirmed) return null;
+    }
+    return currentAction;
+  };
+
+  const handleStart = async (overrideAction?: unknown) => {
     if (!taskId || !task) return;
 
-    if (
-      action === 'restore' &&
-      !confirm('确定要从目标盘恢复数据到 C 盘吗？这将删除现有的目录联接并移回原始数据。')
-    ) {
-      return;
-    }
+    const currentAction = resolveAction(overrideAction);
+    if (!currentAction) return;
 
-    setStatus('running');
-    addLog('--- 开启新操作流程 ---', 'info');
-    setCurrentStage(0);
-    setProgress(5);
-    setErrorMsg(null);
-    addLog(`${action === 'restore' ? '初始化还原任务' : '初始化迁移任务'}: ${task.name}`, 'info');
+    resetTaskStatus(
+      `${currentAction === 'restore' ? '初始化还原任务' : '初始化迁移任务'}: ${task.name}`,
+    );
 
     try {
-      action === 'restore' ? await restoreTask(taskId) : await runMigration(taskId);
+      await executeTaskAction(currentAction);
       setStatus('completed');
       setProgress(100);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      setStatus('error');
-      setErrorMsg(msg);
-      addLog(`任务中止: ${msg}`, 'error');
+      handleMigrationError(msg);
+    }
+  };
+
+  const retryWithKill = async () => {
+    if (!lockingProcesses) return;
+    try {
+      addLog('正在尝试终止占用进程...', 'info');
+      await killProcesses(lockingProcesses);
+      setLockingProcesses(null);
+      await handleStart(action || 'migrate');
+    } catch (err) {
+      addLog(`无法终止进程: ${err}`, 'error');
     }
   };
 
@@ -155,6 +227,8 @@ export function useMonitorTask(taskId: string | null, action: string | null, sta
     progress,
     logs,
     errorMsg,
+    lockingProcesses,
     handleStart,
+    retryWithKill,
   };
 }

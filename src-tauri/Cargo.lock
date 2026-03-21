@@ -495,7 +495,7 @@ dependencies = [
 
 [[package]]
 name = "c-drive-mover"
-version = "0.2.6"
+version = "0.2.16"
 dependencies = [
  "base64 0.22.1",
  "dirs",
@@ -513,6 +513,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-log",
  "walkdir",
+ "windows 0.61.3",
 ]
 
 [[package]]

@@ -57,27 +57,29 @@ function TaskItem({ task, onRun, onRestore, onDelete, onViewLogs }: TaskItemProp
 
   return (
     <div className="bg-white dark:bg-zinc-900 rounded-xl border border-zinc-200 dark:border-zinc-800 p-5 shadow-sm hover:shadow-md transition-all">
-      <div className="flex justify-between items-start mb-4">
-        <div>
+      <div className="flex justify-between items-start mb-4 gap-4">
+        <div className="min-w-0">
           <div className="flex items-center gap-3 mb-1">
-            <h3 className="text-lg font-medium text-zinc-900 dark:text-zinc-100">{task.name}</h3>
+            <h3 className="text-lg font-medium text-zinc-900 dark:text-zinc-100 truncate">
+              {task.name}
+            </h3>
             <span
-              className={`px-2.5 py-0.5 rounded-full text-xs font-medium border ${statusConfig[task.status]?.bg || ''} ${statusConfig[task.status]?.color || ''}`}
+              className={`shrink-0 px-2.5 py-0.5 rounded-full text-xs font-medium border ${statusConfig[task.status]?.bg || ''} ${statusConfig[task.status]?.color || ''}`}
             >
               {statusConfig[task.status]?.label || task.status}
             </span>
           </div>
-          <p className="text-xs text-zinc-500 dark:text-zinc-400 font-mono">
+          <p className="text-xs text-zinc-500 dark:text-zinc-400 font-mono truncate">
             目标盘: {task.target_base} | 总大小: {formatBytes(totalSize)} | 创建于:{' '}
             {new Date(task.created_at * 1000).toLocaleDateString()}
           </p>
           {task.error && (
-            <p className="text-xs text-red-500 mt-2 flex items-center gap-1">
-              <AlertCircle size={12} /> {task.error}
+            <p className="text-xs text-red-500 mt-2 flex items-start gap-1 break-all">
+              <AlertCircle size={12} className="shrink-0 mt-0.5" /> <span>{task.error}</span>
             </p>
           )}
         </div>
-        <div className="flex gap-2">
+        <div className="flex gap-2 shrink-0">
           {(task.status === 'pending' || task.status === 'failed') && (
             <button
               type="button"

@@ -1,3 +1,6 @@
+mod process_utils;
+use crate::process_utils::kill_processes;
+mod rm;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -502,12 +505,7 @@ fn run_migration(
     db: State<'_, DbState>,
     task_id: String,
 ) -> Result<(), String> {
-    // 清除旧日志
-    {
-        if let Ok(conn) = db.0.lock() {
-            let _ = conn.execute("DELETE FROM task_logs WHERE task_id = ?", [&task_id]);
-        }
-    }
+    // 移除了清理旧日志逻辑，以保留“重试检测、占用检测”等历史记录
 
     emit_log(&app_handle, Some(&db), &task_id, format!("开始执行任务: {}", task_id), "info");
     log::info!("Starting migration for task ID: {}", task_id);
@@ -628,21 +626,41 @@ fn run_migration(
         }
 
         if source_path.exists() {
+            let mut options = fs_extra::dir::CopyOptions::new().content_only(false);
             if target_path.exists() {
-                has_error = true;
-                error_msg = format!("目标目录已存在，迁移中止以防止数据覆盖: {:?}", target_path);
-                emit_log(&app_handle, Some(&db), &task_id, error_msg.clone(), "error");
-                log::error!("{}", error_msg);
-                break;
+                emit_log(&app_handle, Some(&db), &task_id, format!("目标目录 {:?} 已存在，将尝试合并/覆盖现有数据继续迁移", target_path), "warn");
+                log::warn!("目标目录已存在，启用覆盖合并模式: {:?}", target_path);
+                options.overwrite = true;
             }
 
             emit_log(&app_handle, Some(&db), &task_id, "正在移动目录文件...".to_string(), "info");
             log::info!("Moving directory...");
-            let options = fs_extra::dir::CopyOptions::new().content_only(false);
             
             // 注意：fs_extra::move_dir(src, dest, options) 会将 src 移动到 dest 目录下
             // 所以我们需要移动到 target_path 的父目录
             let target_parent = target_path.parent().ok_or("无效的目标路径")?;
+
+            // 检查目录占用情况
+            #[cfg(windows)]
+            {
+                match rm::get_locking_processes(source_path) {
+                    Ok(locks) => {
+                        if !locks.is_empty() {
+                            let lock_str = locks.join(", ");
+                            has_error = true;
+                            error_msg = format!("LOCKS_DETECTED:{}:{}", serde_json::to_string(&locks).unwrap_or_default(), source.path);
+                            emit_log(&app_handle, Some(&db), &task_id, format!("检测到目录正在被以下程序占用: {}", lock_str), "error");
+                            log::error!("{}", error_msg);
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        emit_log(&app_handle, Some(&db), &task_id, format!("警告: 无法检测目录占用情况: {}", e), "warn");
+                        log::warn!("无法检测目录占用情况: {}", e);
+                    }
+                }
+            }
+
             if let Err(e) = fs_extra::dir::move_dir(source_path, target_parent, &options) {
                 has_error = true;
                 error_msg = format!("无法移动目录 {}: {}. 请确保没有程序正在使用该目录。", source.path, e);
@@ -726,12 +744,7 @@ fn restore_task(
     db: State<'_, DbState>,
     task_id: String,
 ) -> Result<(), String> {
-    // 清除旧日志
-    {
-        if let Ok(conn) = db.0.lock() {
-            let _ = conn.execute("DELETE FROM task_logs WHERE task_id = ?", [&task_id]);
-        }
-    }
+    // 移除了清理旧日志逻辑，以保留“重试检测、占用检测”等历史记录
 
     emit_log(&app_handle, Some(&db), &task_id, format!("开始还原任务: {}", task_id), "info");
     log::info!("Starting restore for task ID: {}", task_id);
@@ -826,11 +839,8 @@ fn restore_task(
                         break;
                     }
                 } else {
-                    has_error = true;
-                    error_msg = format!("路径 {} 已存在且不是联接点，还原中止以防止数据覆盖。", source.path);
-                    emit_log(&app_handle, Some(&db), &task_id, error_msg.clone(), "error");
-                    log::error!("{}", error_msg);
-                    break;
+                    emit_log(&app_handle, Some(&db), &task_id, format!("路径 {} 不是联接点，说明迁移未完全成功。将尝试把目标数据合并回源目录...", source.path), "warn");
+                    log::warn!("路径 {} 不是联接点，将尝试合并目标数据。 {:?}", source.path, source_path);
                 }
             }
         }
@@ -838,8 +848,36 @@ fn restore_task(
         if target_path.exists() {
             emit_log(&app_handle, Some(&db), &task_id, "正在将数据移回 C 盘...".to_string(), "info");
             log::info!("Moving directory back to C drive...");
-            let options = fs_extra::dir::CopyOptions::new().content_only(false);
             let parent = source_path.parent().ok_or("无法获取源路径父目录")?;
+
+            // 检查目录占用情况
+            #[cfg(windows)]
+            {
+                let mut locks = Vec::new();
+                if let Ok(mut target_locks) = rm::get_locking_processes(&target_path) {
+                    locks.append(&mut target_locks);
+                }
+                if source_path.exists() {
+                    if let Ok(mut source_locks) = rm::get_locking_processes(source_path) {
+                        locks.append(&mut source_locks);
+                    }
+                }
+                locks.sort();
+                locks.dedup();
+
+                if !locks.is_empty() {
+                    let lock_str = locks.join(", ");
+                    has_error = true;
+                    error_msg = format!("LOCKS_DETECTED:{}:{}", serde_json::to_string(&locks).unwrap_or_default(), source.path);
+                    emit_log(&app_handle, Some(&db), &task_id, format!("检测到目录正在被以下程序占用: {}", lock_str), "error");
+                    log::error!("{}", error_msg);
+                    break;
+                }
+            }
+            
+            let mut options = fs_extra::dir::CopyOptions::new().content_only(false);
+            options.overwrite = true; // 开启覆盖模式以支持合并
+
             if let Err(e) = fs_extra::dir::move_dir(&target_path, parent, &options) {
                 has_error = true;
                 error_msg = format!("无法将数据移回 {}: {}. 请确保目标位置可写。", source.path, e);
@@ -940,7 +978,7 @@ fn search_everything(db: State<DbState>, query: String) -> Result<Vec<FileEntry>
             let full_path = format!("{}\\{}", path, name);
             let is_junction = junction::exists(&full_path).unwrap_or(false);
             // 这里 Everything 搜索出来的全是 folder
-            if is_junction || true { // it's already a folder search
+            {
                 let target_path = if is_junction {
                     std::fs::read_link(&full_path).ok().map(|p| p.to_string_lossy().into_owned())
                 } else {
@@ -1392,8 +1430,8 @@ pub fn run() {
             save_task,
             run_migration,
             restore_task,
-            get_home_dir,
-            search_everything,
+            kill_processes,
+            get_home_dir,            search_everything,
             select_directory,
             get_settings,
             save_settings,

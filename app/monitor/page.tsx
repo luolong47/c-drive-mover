@@ -8,6 +8,7 @@ import {
   Loader2,
   Play,
   RotateCcw,
+  ShieldAlert,
   Terminal,
 } from 'lucide-react';
 import { useRouter, useSearchParams } from 'next/navigation';
@@ -41,8 +42,10 @@ const RESTORE_STAGES: Stage[] = [
 function LogTerminal({ logs }: { logs: LogEntry[] }) {
   const logsEndRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
-    logsEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, []);
+    if (logs.length > 0) {
+      logsEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [logs]);
 
   return (
     <div className="lg:col-span-2 bg-[#151619] rounded-xl border border-zinc-800 flex flex-col shadow-xl overflow-hidden min-h-0 h-[400px] lg:h-auto">
@@ -90,7 +93,8 @@ function MonitorHeader({
   onBack: () => void;
 }) {
   const isIdle = status === 'idle' && action !== 'view';
-  const isFinished = status === 'completed' || status === 'error' || action === 'view';
+  const isFinished =
+    status === 'completed' || status === 'error' || status === 'locked' || action === 'view';
 
   return (
     <header className="mb-6 flex justify-between items-end shrink-0">
@@ -141,6 +145,29 @@ function MonitorHeader({
   );
 }
 
+const getStatusBadgeStyles = (status: string) => {
+  switch (status) {
+    case 'idle':
+      return 'bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-400 border-zinc-200 dark:border-zinc-700';
+    case 'running':
+      return 'bg-blue-50 dark:bg-blue-500/10 text-blue-600 dark:text-blue-400 border-blue-200 dark:border-blue-500/20 animate-pulse';
+    case 'completed':
+      return 'bg-emerald-50 dark:bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border-emerald-200 dark:border-emerald-500/20';
+    case 'locked':
+      return 'bg-amber-50 dark:bg-amber-500/10 text-amber-600 dark:text-amber-400 border-amber-200 dark:border-amber-500/20';
+    default:
+      return 'bg-red-50 dark:bg-red-500/10 text-red-600 dark:text-red-400 border-red-200 dark:border-red-500/20';
+  }
+};
+
+const getStatusLabel = (status: string, action: string | null) => {
+  if (status === 'idle') return action === 'view' ? '查看历史' : '等待执行';
+  if (status === 'running') return action === 'restore' ? '还原中...' : '迁移中...';
+  if (status === 'completed') return '执行成功';
+  if (status === 'locked') return '目录被占用';
+  return '执行失败';
+};
+
 function TaskOverviewCard({
   task,
   status,
@@ -186,20 +213,9 @@ function TaskOverviewCard({
         <div className="flex justify-between items-center pt-3 border-t border-zinc-100 dark:border-zinc-800">
           <span className="text-zinc-500 dark:text-zinc-400">当前状态</span>
           <span
-            className={`px-2.5 py-1 rounded-md text-xs font-medium border transition-colors ${
-              status === 'idle'
-                ? 'bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-400 border-zinc-200 dark:border-zinc-700'
-                : status === 'running'
-                  ? 'bg-blue-50 dark:bg-blue-500/10 text-blue-600 dark:text-blue-400 border-blue-200 dark:border-blue-500/20 animate-pulse'
-                  : status === 'completed'
-                    ? 'bg-emerald-50 dark:bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border-emerald-200 dark:border-emerald-500/20'
-                    : 'bg-red-50 dark:bg-red-500/10 text-red-600 dark:text-red-400 border-red-200 dark:border-red-500/20'
-            }`}
+            className={`px-2.5 py-1 rounded-md text-xs font-medium border transition-colors ${getStatusBadgeStyles(status)}`}
           >
-            {status === 'idle' && (action === 'view' ? '查看历史' : '等待执行')}
-            {status === 'running' && (action === 'restore' ? '还原中...' : '迁移中...')}
-            {status === 'completed' && '执行成功'}
-            {status === 'error' && '执行失败'}
+            {getStatusLabel(status, action)}
           </span>
         </div>
       </div>
@@ -279,6 +295,12 @@ function ProgressMonitorCard({
           <p className="text-xs text-red-600 dark:text-red-400 break-all">{errorMsg}</p>
         </div>
       )}
+      {status === 'locked' && (
+        <div className="mt-auto p-3 bg-amber-50 dark:bg-amber-500/10 border border-amber-100 dark:border-amber-500/20 rounded-lg flex items-start gap-2">
+          <ShieldAlert size={16} className="text-amber-600 shrink-0 mt-0.5" />
+          <p className="text-xs text-amber-700 dark:text-amber-400 break-all">{errorMsg}</p>
+        </div>
+      )}
     </div>
   );
 }
@@ -292,15 +314,21 @@ function MonitorContent() {
   const action = searchParams.get('action');
 
   const stages = action === 'restore' ? RESTORE_STAGES : MIGRATION_STAGES;
-  const { task, status, currentStage, progress, logs, errorMsg, handleStart } = useMonitorTask(
-    taskId,
-    action,
-    stages.length,
-  );
+  const {
+    task,
+    status,
+    currentStage,
+    progress,
+    logs,
+    errorMsg,
+    lockingProcesses,
+    handleStart,
+    retryWithKill,
+  } = useMonitorTask(taskId, action, stages.length);
 
   const onBack = () => router.push('/tasks');
 
-  if (errorMsg && status !== 'error') {
+  if (errorMsg && status !== 'error' && status !== 'locked') {
     return (
       <div className="p-8 text-center">
         <AlertCircle size={48} className="mx-auto text-red-500 mb-4" />
@@ -321,8 +349,54 @@ function MonitorContent() {
   }
 
   return (
-    <div className="p-8 max-w-6xl mx-auto h-full flex flex-col">
+    <div className="p-8 max-w-6xl mx-auto h-full flex flex-col relative">
       <MonitorHeader status={status} action={action} onStart={handleStart} onBack={onBack} />
+
+      {/* Lock Resolution Dialog Overlay */}
+      {status === 'locked' && lockingProcesses && (
+        <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm rounded-3xl">
+          <div className="bg-white dark:bg-zinc-900 w-[420px] rounded-2xl shadow-2xl border border-amber-200 dark:border-amber-500/30 overflow-hidden animate-in fade-in zoom-in duration-200">
+            <div className="bg-amber-50 dark:bg-amber-500/10 px-6 py-5 border-b border-amber-100 dark:border-amber-500/20">
+              <div className="flex items-center gap-3 text-amber-600 dark:text-amber-500">
+                <ShieldAlert size={24} />
+                <h3 className="text-lg font-semibold">检测到目录被占用</h3>
+              </div>
+            </div>
+            <div className="p-6">
+              <p className="text-sm text-zinc-600 dark:text-zinc-400 leading-relaxed mb-4">
+                迁移过程中，下列程序正在使用该目录，导致无法继续。是否要尝试终止这些进程并重试？
+              </p>
+              <div className="bg-zinc-50 dark:bg-zinc-800/50 rounded-lg p-3 border border-zinc-100 dark:border-zinc-800/80 mb-6">
+                <ul className="text-xs font-mono space-y-1.5 text-zinc-700 dark:text-zinc-300">
+                  {lockingProcesses.map((p) => (
+                    <li key={p} className="flex items-center gap-2">
+                      <span className="w-1.5 h-1.5 rounded-full bg-amber-400 shrink-0" />
+                      {p}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+              <div className="flex gap-3">
+                <button
+                  type="button"
+                  onClick={() => router.push('/tasks')}
+                  className="flex-1 px-4 py-2.5 text-sm font-medium text-zinc-600 dark:text-zinc-400 bg-zinc-100 dark:bg-zinc-800 hover:bg-zinc-200 dark:hover:bg-zinc-700 rounded-xl transition-colors"
+                >
+                  放弃任务
+                </button>
+                <button
+                  type="button"
+                  onClick={retryWithKill}
+                  className="flex-1 px-4 py-2.5 text-sm font-medium text-white bg-amber-600 hover:bg-amber-700 rounded-xl transition-colors shadow-lg shadow-amber-600/20"
+                >
+                  终止进程并重试
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 flex-1 min-h-0">
         <div className="lg:col-span-1 flex flex-col gap-6 min-h-0">
           <TaskOverviewCard task={task} status={status} action={action} />
