@@ -66,6 +66,14 @@ export async function getTasks(): Promise<MoveTask[]> {
   return await invoke('get_tasks');
 }
 
+export async function checkPlans(): Promise<number> {
+  return await invoke('check_plans');
+}
+
+export async function fixUserDirectories(): Promise<number> {
+  return await invoke('fix_user_directories');
+}
+
 export async function deleteTask(task_id: string): Promise<void> {
   await invoke('delete_task', { taskId: task_id });
 }

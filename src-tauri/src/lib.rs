@@ -222,6 +222,10 @@ fn delete_task(db: State<DbState>, task_id: String) -> Result<(), String> {
 
 #[tauri::command]
 fn get_tasks(db: State<DbState>) -> Result<Vec<MoveTask>, String> {
+    get_tasks_impl(&db)
+}
+
+fn get_tasks_impl(db: &DbState) -> Result<Vec<MoveTask>, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
     let mut stmt = conn
         .prepare(
@@ -267,6 +271,116 @@ fn get_tasks(db: State<DbState>) -> Result<Vec<MoveTask>, String> {
         tasks.push(task);
     }
     Ok(tasks)
+}
+
+fn replace_user_dir(path: &str, current_home: &str) -> String {
+    let lower_path = path.to_lowercase();
+    if lower_path.starts_with("c:\\users\\") {
+        let parts: Vec<&str> = path.splitn(4, '\\').collect();
+        if parts.len() >= 3 {
+            if parts.len() == 4 {
+                return format!("{}\\{}", current_home, parts[3]);
+            } else {
+                return current_home.to_string();
+            }
+        }
+    }
+    path.to_string()
+}
+
+#[tauri::command]
+async fn check_plans(db: State<'_, DbState>) -> Result<usize, String> {
+    let tasks = get_tasks_impl(&db)?;
+    let mut updated_count = 0;
+    
+    for task in tasks.into_iter().filter(|t| t.status == "success") {
+        let mut needs_migration = false;
+        
+        let target_root = std::path::Path::new(&task.target_base).join(&task.name);
+
+        for source in &task.sources {
+            let source_path = std::path::Path::new(&source.path);
+            
+            let rel_path = if !task.common_prefix.is_empty() && source.path.starts_with(&task.common_prefix) {
+                &source.path[task.common_prefix.len()..]
+            } else {
+                source_path.file_name().and_then(|n| n.to_str()).unwrap_or("")
+            };
+            let rel_path = rel_path.trim_start_matches('\\').trim_start_matches('/');
+            let target_path = target_root.join(rel_path);
+
+            let is_junction = {
+                #[cfg(windows)]
+                {
+                    junction::exists(source_path).unwrap_or(false)
+                }
+                #[cfg(not(windows))]
+                {
+                    source_path.read_link().is_ok()
+                }
+            };
+
+            if (!source_path.exists() || !is_junction) && target_path.exists() {
+                needs_migration = true;
+                break;
+            }
+        }
+        
+        if needs_migration {
+            let conn = db.0.lock().map_err(|e| e.to_string())?;
+            conn.execute(
+                "UPDATE tasks SET status = 'pending' WHERE id = ?",
+                [&task.id],
+            ).map_err(|e| e.to_string())?;
+            updated_count += 1;
+        }
+    }
+    
+    Ok(updated_count)
+}
+
+#[tauri::command]
+async fn fix_user_directories(db: State<'_, DbState>) -> Result<usize, String> {
+    let home_dir = dirs::home_dir().ok_or("无法获取当前用户目录")?;
+    let current_home = home_dir.to_string_lossy().to_string();
+    
+    let tasks = get_tasks_impl(&db)?;
+    let mut updated_count = 0;
+    
+    for mut task in tasks {
+        let mut modified = false;
+        
+        let new_prefix = replace_user_dir(&task.common_prefix, &current_home);
+        if new_prefix != task.common_prefix {
+            task.common_prefix = new_prefix;
+            modified = true;
+        }
+        
+        for source in &mut task.sources {
+            let new_path = replace_user_dir(&source.path, &current_home);
+            if new_path != source.path {
+                // Update source path in DB
+                let conn = db.0.lock().map_err(|e| e.to_string())?;
+                conn.execute(
+                    "UPDATE task_sources SET path = ? WHERE task_id = ? AND path = ?",
+                    params![new_path, task.id, source.path],
+                ).map_err(|e| e.to_string())?;
+                source.path = new_path;
+                modified = true;
+            }
+        }
+        
+        if modified {
+            let conn = db.0.lock().map_err(|e| e.to_string())?;
+            conn.execute(
+                "UPDATE tasks SET common_prefix = ? WHERE id = ?",
+                params![task.common_prefix, task.id],
+            ).map_err(|e| e.to_string())?;
+            updated_count += 1;
+        }
+    }
+    
+    Ok(updated_count)
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -486,12 +600,13 @@ async fn run_migration(
         );
         log::info!("Processing source: {:?} -> {:?}", source_path, target_path);
 
-        if !source_path.exists() {
-            has_error = true;
-            error_msg = format!("源目录不存在: {}", source.path);
-            emit_log(&app_handle, Some(&db), &task_id, error_msg.clone(), "error");
-            log::error!("{}", error_msg);
-            break;
+        #[cfg(windows)]
+        {
+            if source_path.exists() && junction::exists(source_path).unwrap_or(false) {
+                emit_log(&app_handle, Some(&db), &task_id, format!("目录已经是联接，跳过: {}", source.path), "info");
+                log::info!("Directory is already a junction, skipping: {:?}", source_path);
+                continue;
+            }
         }
 
         if let Some(parent) = target_path.parent() {
@@ -507,27 +622,55 @@ async fn run_migration(
             }
         }
 
-        if target_path.exists() {
-            has_error = true;
-            error_msg = format!("目标目录已存在，迁移中止以防止数据覆盖: {:?}", target_path);
-            emit_log(&app_handle, Some(&db), &task_id, error_msg.clone(), "error");
-            log::error!("{}", error_msg);
-            break;
+        if source_path.exists() {
+            if target_path.exists() {
+                has_error = true;
+                error_msg = format!("目标目录已存在，迁移中止以防止数据覆盖: {:?}", target_path);
+                emit_log(&app_handle, Some(&db), &task_id, error_msg.clone(), "error");
+                log::error!("{}", error_msg);
+                break;
+            }
+
+            emit_log(&app_handle, Some(&db), &task_id, "正在移动目录文件...".to_string(), "info");
+            log::info!("Moving directory...");
+            let options = fs_extra::dir::CopyOptions::new().content_only(false);
+            
+            // 注意：fs_extra::move_dir(src, dest, options) 会将 src 移动到 dest 目录下
+            // 所以我们需要移动到 target_path 的父目录
+            let target_parent = target_path.parent().ok_or("无效的目标路径")?;
+            if let Err(e) = fs_extra::dir::move_dir(source_path, target_parent, &options) {
+                has_error = true;
+                error_msg = format!("无法移动目录 {}: {}. 请确保没有程序正在使用该目录。", source.path, e);
+                emit_log(&app_handle, Some(&db), &task_id, error_msg.clone(), "error");
+                log::error!("{}", error_msg);
+                break;
+            }
+        } else {
+            emit_log(&app_handle, Some(&db), &task_id, format!("源目录不存在，准备直接创建联接: {}", source.path), "info");
+            log::info!("Source directory does not exist, checking target directly: {:?}", source_path);
+            if !target_path.exists() {
+                log::info!("Creating target directory: {:?}", target_path);
+                if let Err(e) = fs::create_dir_all(&target_path) {
+                    has_error = true;
+                    error_msg = format!("无法创建目标目录 {:?}: {}", target_path, e);
+                    emit_log(&app_handle, Some(&db), &task_id, error_msg.clone(), "error");
+                    log::error!("{}", error_msg);
+                    break;
+                }
+            }
         }
 
-        emit_log(&app_handle, Some(&db), &task_id, "正在移动目录文件...".to_string(), "info");
-        log::info!("Moving directory...");
-        let options = fs_extra::dir::CopyOptions::new().content_only(false);
-        
-        // 注意：fs_extra::move_dir(src, dest, options) 会将 src 移动到 dest 目录下
-        // 所以我们需要移动到 target_path 的父目录
-        let target_parent = target_path.parent().ok_or("无效的目标路径")?;
-        if let Err(e) = fs_extra::dir::move_dir(source_path, target_parent, &options) {
-            has_error = true;
-            error_msg = format!("无法移动目录 {}: {}. 请确保没有程序正在使用该目录。", source.path, e);
-            emit_log(&app_handle, Some(&db), &task_id, error_msg.clone(), "error");
-            log::error!("{}", error_msg);
-            break;
+        if let Some(source_parent) = source_path.parent() {
+            if !source_parent.exists() {
+                log::info!("Creating source parent directory: {:?}", source_parent);
+                if let Err(e) = fs::create_dir_all(source_parent) {
+                    has_error = true;
+                    error_msg = format!("无法创建源父目录 {:?}: {}", source_parent, e);
+                    emit_log(&app_handle, Some(&db), &task_id, error_msg.clone(), "error");
+                    log::error!("{}", error_msg);
+                    break;
+                }
+            }
         }
 
         #[cfg(windows)]
@@ -1213,6 +1356,8 @@ pub fn run() {
             get_folder_size,
             delete_task,
             get_tasks,
+            check_plans,
+            fix_user_directories,
             get_task_logs,
             save_task,
             run_migration,

@@ -22,6 +22,8 @@ import { useTheme } from 'next-themes';
 import { useEffect, useState } from 'react';
 import {
   type AppSettings,
+  checkPlans,
+  fixUserDirectories,
   getSettings,
   saveSettings,
   selectDirectory,
@@ -460,6 +462,57 @@ export default function SettingsPage() {
                 />
                 <div className="w-11 h-6 bg-zinc-200 dark:bg-zinc-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-zinc-300 dark:after:border-zinc-600 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-indigo-500" />
               </label>
+            </div>
+
+            {/* System Recovery Operations */}
+            <div className="pt-6 border-t border-zinc-200/50 dark:border-zinc-700/50 space-y-6">
+              <div className="flex items-center justify-between">
+                <div>
+                  <h3 className="text-sm font-medium text-zinc-900 dark:text-zinc-100">方案检测</h3>
+                  <p className="text-xs text-zinc-500 dark:text-zinc-400 mt-1">
+                    重装系统后检查方案状态，将丢失源目录的方案标记为待迁移
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={async () => {
+                    try {
+                      const count = await checkPlans();
+                      alert(`检测完成，已将 ${count} 个方案标记为待迁移`);
+                    } catch (error) {
+                      alert(`检测失败: ${error}`);
+                    }
+                  }}
+                  className="px-4 py-2 bg-zinc-100 dark:bg-zinc-800 hover:bg-zinc-200 dark:hover:bg-zinc-700 text-zinc-900 dark:text-zinc-100 text-sm font-medium rounded-lg transition-colors border border-zinc-200/50 dark:border-zinc-700/50 shadow-sm"
+                >
+                  开始检测
+                </button>
+              </div>
+
+              <div className="flex items-center justify-between">
+                <div>
+                  <h3 className="text-sm font-medium text-zinc-900 dark:text-zinc-100">
+                    用户目录修复
+                  </h3>
+                  <p className="text-xs text-zinc-500 dark:text-zinc-400 mt-1">
+                    重装系统后一键将方案中的旧用户目录替换为当前用户目录
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={async () => {
+                    try {
+                      const count = await fixUserDirectories();
+                      alert(`修复完成，已更新 ${count} 个方案的用户目录`);
+                    } catch (error) {
+                      alert(`修复失败: ${error}`);
+                    }
+                  }}
+                  className="px-4 py-2 bg-zinc-100 dark:bg-zinc-800 hover:bg-zinc-200 dark:hover:bg-zinc-700 text-zinc-900 dark:text-zinc-100 text-sm font-medium rounded-lg transition-colors border border-zinc-200/50 dark:border-zinc-700/50 shadow-sm"
+                >
+                  一键修复
+                </button>
+              </div>
             </div>
           </div>
         </section>
