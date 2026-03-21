@@ -1,8 +1,7 @@
 import type { NextConfig } from 'next';
+import pkg from './package.json' with { type: 'json' };
 
-const date = new Date();
-// 简写格式: vYY.MMDD.HHmm (例如: v26.0316.0904)
-const buildVersion = `v${String(date.getFullYear()).slice(-2)}.${String(date.getMonth() + 1).padStart(2, '0')}${String(date.getDate()).padStart(2, '0')}.${String(date.getHours()).padStart(2, '0')}${String(date.getMinutes()).padStart(2, '0')}`;
+const buildVersion = `v${pkg.version}`;
 
 const nextConfig: NextConfig = {
   env: {

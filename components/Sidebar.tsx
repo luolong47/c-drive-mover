@@ -62,7 +62,7 @@ export default function Sidebar() {
         <div>
           <h1 className="font-semibold text-lg leading-tight">C-Drive Mover</h1>
           <p className="text-xs text-zinc-500 font-mono mt-0.5">
-            {process.env.NEXT_PUBLIC_BUILD_VERSION || 'v26.0318.1050'}
+            {process.env.NEXT_PUBLIC_BUILD_VERSION || 'v0.0.0'}
           </p>
         </div>
       </div>

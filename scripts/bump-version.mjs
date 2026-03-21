@@ -24,14 +24,14 @@ const newVersion = versionParts.join('.');
 console.log(`Bumping version from ${pkg.version} to ${newVersion} (${type})`);
 
 pkg.version = newVersion;
-fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n', 'utf8');
+fs.writeFileSync(pkgPath, `${JSON.stringify(pkg, null, 2)}\n`, 'utf8');
 
 // Update tauri.conf.json
 const tauriConfPath = path.resolve(projectRoot, 'src-tauri', 'tauri.conf.json');
 if (fs.existsSync(tauriConfPath)) {
   const tauriConf = JSON.parse(fs.readFileSync(tauriConfPath, 'utf8'));
   tauriConf.version = newVersion;
-  fs.writeFileSync(tauriConfPath, JSON.stringify(tauriConf, null, 2) + '\n', 'utf8');
+  fs.writeFileSync(tauriConfPath, `${JSON.stringify(tauriConf, null, 2)}\n`, 'utf8');
 }
 
 // Update Cargo.toml

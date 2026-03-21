@@ -1,10 +1,12 @@
 {
   "name": "c-drive-mover",
-  "version": "0.1.0",
+  "version": "0.2.3",
   "private": true,
   "scripts": {
     "lint": "biome check --write .",
-    "prebuild": "(sudo taskkill /F /IM c-drive-mover.exe /T 2>nul || type nul) & pnpm lint",
+    "bump:patch": "node scripts/bump-version.mjs patch",
+    "bump:minor": "node scripts/bump-version.mjs minor",
+    "prebuild": "(sudo taskkill /F /IM c-drive-mover.exe /T 2>nul || type nul) && pnpm bump:patch && pnpm lint",
     "build": "set NEXT_PRIVATE_LOCAL_SKIP_WASM_HASH=1&& tauri build && node -e \"const fs=require('fs'); if(!fs.existsSync('dist/release'))fs.mkdirSync('dist/release', {recursive:true}); fs.copyFileSync('src-tauri/target/release/c-drive-mover.exe', 'dist/release/c-drive-mover.exe')\""
   },
   "dependencies": {
