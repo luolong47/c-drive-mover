@@ -8,3 +8,6 @@ coverage/
 out/
 .idea/
 dist/
+
+.gemini/
+gha-creds-*.json
